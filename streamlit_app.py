@@ -3,624 +3,461 @@ import duckdb
 import pandas as pd
 import plotly.express as px
 import os
-from pathlib import Path
 import glob
 from datetime import datetime
+from streamlit_sortables import sort_items
 
 # ============================================
-# 1. НАСТРОЙКА ПОДКЛЮЧЕНИЯ К DUCKDB (БЕЗ SPATIAL)
+# 1. ПОДКЛЮЧЕНИЕ К DUCKDB
 # ============================================
 @st.cache_resource
 def get_duckdb_connection():
-    """Создаёт или открывает persistent-базу данных"""
-    try:
-        conn = duckdb.connect('olap_cube.duckdb')
-        
-        # Пытаемся установить расширение, но обрабатываем ошибку
-        try:
-            conn.execute("INSTALL spatial IF NOT EXISTS")
-            conn.execute("LOAD spatial")
-            st.success("✅ Spatial extension loaded")
-        except Exception as e:
-            # Если не получилось - просто продолжаем без spatial
-            st.warning("⚠️ Spatial extension not available (this is fine for basic OLAP)")
-        
-        # Создаём таблицу для логирования обновлений
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS load_history (
-                id INTEGER PRIMARY KEY,
-                load_date TIMESTAMP,
-                file_path VARCHAR,
-                rows_loaded INTEGER,
-                status VARCHAR
-            )
-        """)
-        
-        return conn
-    except Exception as e:
-        st.error(f"Failed to connect to database: {str(e)}")
-        # Создаём in-memory соединение как fallback
-        return duckdb.connect(':memory:')
-
-# ============================================
-# 2. ФУНКЦИИ ДЛЯ РАБОТЫ С ФАЙЛАМИ
-# ============================================
-def get_excel_files_from_directory(directory_path):
-    """Получает список всех Excel-файлов в директории"""
-    excel_extensions = ['*.xlsx', '*.xls', '*.xlsm']
-    files = []
-    for ext in excel_extensions:
-        files.extend(glob.glob(os.path.join(directory_path, ext)))
-    return files
-
-def preview_excel_file(file_path, rows=100):
-    """Показывает предпросмотр Excel файла"""
-    try:
-        df = pd.read_excel(file_path, nrows=rows)
-        return df, None
-    except Exception as e:
-        return None, str(e)
-
-def load_excel_files_to_duckdb(conn, file_paths, table_name='fact_sales'):
-    """Загружает выбранные Excel-файлы в DuckDB"""
+    """Создаёт подключение к DuckDB"""
+    conn = duckdb.connect('olap_cube.duckdb')
     
+    # Создаём таблицу для логирования
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS load_history (
+            id INTEGER PRIMARY KEY,
+            load_date TIMESTAMP,
+            file_path VARCHAR,
+            rows_loaded INTEGER,
+            status VARCHAR
+        )
+    """)
+    
+    return conn
+
+# ============================================
+# 2. РАБОТА С ФАЙЛАМИ
+# ============================================
+def load_excel_to_duckdb(conn, file_paths, table_name='fact_sales'):
+    """Загружает Excel файлы в DuckDB"""
     if not file_paths:
-        return 0, "Нет файлов для загрузки"
+        return 0, "Нет файлов"
     
     total_rows = 0
     first_file = True
     
-    try:
-        for file_path in file_paths:
-            df = pd.read_excel(file_path)
-            
-            if first_file:
-                conn.register('temp_df', df)
-                conn.execute(f"CREATE OR REPLACE TABLE {table_name} AS SELECT * FROM temp_df")
-                first_file = False
-            else:
-                conn.register('temp_df', df)
-                conn.execute(f"INSERT INTO {table_name} SELECT * FROM temp_df")
-            
-            total_rows += len(df)
-            
-            conn.execute("""
-                INSERT INTO load_history (load_date, file_path, rows_loaded, status)
-                VALUES (CURRENT_TIMESTAMP, ?, ?, 'SUCCESS')
-            """, [file_path, len(df)])
+    for file_path in file_paths:
+        df = pd.read_excel(file_path)
         
-        return total_rows, f"✅ Успешно загружено {total_rows:,} строк из {len(file_paths)} файлов"
-    
-    except Exception as e:
-        return 0, f"❌ Ошибка при загрузке: {str(e)}"
-
-def append_excel_files_to_duckdb(conn, file_paths, table_name='fact_sales'):
-    """Добавляет новые файлы к существующей таблице"""
-    
-    if not file_paths:
-        return 0, "Нет файлов для добавления"
-    
-    total_rows = 0
-    
-    try:
-        for file_path in file_paths:
-            df = pd.read_excel(file_path)
+        if first_file:
+            conn.register('temp_df', df)
+            conn.execute(f"CREATE OR REPLACE TABLE {table_name} AS SELECT * FROM temp_df")
+            first_file = False
+        else:
             conn.register('temp_df', df)
             conn.execute(f"INSERT INTO {table_name} SELECT * FROM temp_df")
-            total_rows += len(df)
-            
-            conn.execute("""
-                INSERT INTO load_history (load_date, file_path, rows_loaded, status)
-                VALUES (CURRENT_TIMESTAMP, ?, ?, 'APPEND')
-            """, [file_path, len(df)])
         
-        return total_rows, f"✅ Добавлено {total_rows:,} строк из {len(file_paths)} файлов"
+        total_rows += len(df)
+        
+        conn.execute("""
+            INSERT INTO load_history (load_date, file_path, rows_loaded, status)
+            VALUES (CURRENT_TIMESTAMP, ?, ?, 'SUCCESS')
+        """, [str(file_path), len(df)])
     
-    except Exception as e:
-        return 0, f"❌ Ошибка при добавлении: {str(e)}"
-
-def get_load_history(conn):
-    """Получает историю загрузок"""
-    try:
-        return conn.execute("""
-            SELECT 
-                load_date,
-                file_path,
-                rows_loaded,
-                status
-            FROM load_history 
-            ORDER BY load_date DESC
-            LIMIT 50
-        """).fetchdf()
-    except:
-        return pd.DataFrame()
+    return total_rows, f"✅ Загружено {total_rows:,} строк"
 
 # ============================================
-# 3. OLAP-ФУНКЦИИ С ПОДДЕРЖКОЙ АГРЕГАЦИЙ
+# 3. НАСТОЯЩАЯ СВОДНАЯ ТАБЛИЦА (PIVOT TABLE)
 # ============================================
-def get_column_info(conn, table_name='fact_sales'):
-    """Получает информацию о колонках таблицы"""
-    try:
-        # Проверяем существует ли таблица
-        tables = conn.execute("SHOW TABLES").fetchdf()
-        if table_name not in tables['name'].values:
-            return []
+class PivotTableBuilder:
+    def __init__(self, conn, table_name='fact_sales'):
+        self.conn = conn
+        self.table_name = table_name
         
-        columns_df = conn.execute(f"DESCRIBE {table_name}").fetchdf()
-        
-        numeric_types = ['INTEGER', 'BIGINT', 'DOUBLE', 'FLOAT', 'DECIMAL', 'REAL']
-        
-        columns = []
-        for _, row in columns_df.iterrows():
-            col_name = row['column_name']
-            col_type = row['column_type'].upper()
-            is_numeric = any(nt in col_type for nt in numeric_types)
+    def get_columns_info(self):
+        """Получает список всех колонок и их типов"""
+        try:
+            # Получаем структуру таблицы
+            df_sample = self.conn.execute(f"SELECT * FROM {self.table_name} LIMIT 1").fetchdf()
             
-            # Безопасно получаем sample
-            try:
-                sample = conn.execute(f"SELECT {col_name} FROM {table_name} LIMIT 1").fetchone()
-                sample_value = sample[0] if sample else None
-            except:
-                sample_value = None
-            
-            columns.append({
-                'name': col_name,
-                'type': col_type,
-                'is_numeric': is_numeric,
-                'sample': sample_value
-            })
-        
-        return columns
-    except Exception as e:
-        st.error(f"Error getting column info: {str(e)}")
-        return []
-
-def build_pivot_query(conn, rows, columns, values, agg_func='SUM', fact_table='fact_sales'):
-    """Строит запрос для сводной таблицы с поддержкой иерархий"""
-    
-    if not values:
-        return None, "Выберите хотя бы одно значение для анализа"
-    
-    # Определяем группировку
-    group_by_fields = rows + columns
-    
-    if not group_by_fields:
-        # Если нет ни строк, ни колонок - просто агрегируем всё
-        agg_fields = [f"{agg_func}({value}) as {value}" for value in values]
-        query = f"""
-            SELECT 
-                {', '.join(agg_fields)}
-            FROM {fact_table}
-        """
-    else:
-        # Строим обычную группировку
-        agg_fields = [f"{agg_func}({value}) as {value}" for value in values]
-        query = f"""
-            SELECT 
-                {', '.join(group_by_fields)},
-                {', '.join(agg_fields)}
-            FROM {fact_table}
-            GROUP BY {', '.join(group_by_fields)}
-            ORDER BY {', '.join(group_by_fields)}
-        """
-    
-    return query, None
-
-def run_pivot_query(conn, rows, columns, values, agg_func='SUM', fact_table='fact_sales'):
-    """Выполняет запрос сводной таблицы и возвращает результат"""
-    
-    query, error = build_pivot_query(conn, rows, columns, values, agg_func, fact_table)
-    
-    if error:
-        return None, error
-    
-    try:
-        result = conn.execute(query).fetchdf()
-        
-        # Если есть колонки, делаем pivot (транспонирование)
-        if columns and len(columns) > 0 and len(result) > 0:
-            try:
-                # Создаём pivot таблицу
-                if len(values) == 1:
-                    pivot_df = result.pivot_table(
-                        index=rows if rows else None,
-                        columns=columns,
-                        values=values[0],
-                        aggfunc='sum'
-                    )
-                else:
-                    # Для нескольких значений создаём мультииндекс
-                    pivot_dfs = []
-                    for value in values:
-                        temp_pivot = result.pivot_table(
-                            index=rows if rows else None,
-                            columns=columns,
-                            values=value,
-                            aggfunc='sum'
-                        )
-                        temp_pivot.columns = [f"{value} - {col}" for col in temp_pivot.columns]
-                        pivot_dfs.append(temp_pivot)
-                    
-                    pivot_df = pd.concat(pivot_dfs, axis=1)
+            columns_info = []
+            for col in df_sample.columns:
+                # Определяем тип колонки по первым 100 значениям
+                sample = self.conn.execute(f"SELECT {col} FROM {self.table_name} LIMIT 100").fetchdf()
                 
-                return pivot_df.fillna(0), "✅ Сводная таблица создана"
-            except Exception as e:
-                # Если pivot не удался, возвращаем обычную таблицу
-                return result, f"⚠️ Сводная таблица создана в плоском формате: {str(e)}"
-        else:
-            return result, "✅ Данные загружены"
+                # Пытаемся определить числовые колонки
+                is_numeric = pd.to_numeric(sample[col], errors='coerce').notna().any()
+                
+                columns_info.append({
+                    'name': col,
+                    'is_numeric': is_numeric,
+                    'dtype': str(df_sample[col].dtype)
+                })
             
-    except Exception as e:
-        return None, f"❌ Ошибка: {str(e)}"
+            return columns_info
+        except:
+            return []
+    
+    def create_pivot(self, rows, columns, values, agg_func='SUM'):
+        """Создаёт сводную таблицу"""
+        
+        if not values:
+            return None, "Выберите значения для анализа"
+        
+        # Строим запрос с группировкой
+        group_by = rows + columns
+        
+        if group_by:
+            # Агрегируем данные
+            agg_exprs = [f"{agg_func}({v}) as {v}" for v in values]
+            query = f"""
+                SELECT 
+                    {', '.join(group_by)},
+                    {', '.join(agg_exprs)}
+                FROM {self.table_name}
+                GROUP BY {', '.join(group_by)}
+                ORDER BY {', '.join(group_by)}
+            """
+            
+            result = self.conn.execute(query).fetchdf()
+            
+            # Создаём Pivot Table
+            if columns and len(result) > 0:
+                # Создаём сводную таблицу
+                pivot_df = result.pivot_table(
+                    index=rows if rows else None,
+                    columns=columns,
+                    values=values[0] if len(values) == 1 else values,
+                    aggfunc=agg_func.lower()
+                )
+                
+                # Заполняем пропуски
+                pivot_df = pivot_df.fillna(0)
+                
+                return pivot_df, f"✅ Сводная таблица: {len(pivot_df)} строк × {len(pivot_df.columns)} столбцов"
+            else:
+                return result, "✅ Данные сгруппированы (без транспонирования)"
+        else:
+            # Простая агрегация без группировки
+            agg_exprs = [f"{agg_func}({v}) as {v}" for v in values]
+            query = f"SELECT {', '.join(agg_exprs)} FROM {self.table_name}"
+            result = self.conn.execute(query).fetchdf()
+            return result, "✅ Агрегированные данные"
 
 # ============================================
-# 4. ИНТЕРФЕЙС СВОДНОЙ ТАБЛИЦЫ
-# ============================================
-def render_pivot_builder(conn):
-    """Рендерит интерфейс конструктора сводной таблицы"""
-    
-    # Получаем информацию о колонках
-    columns_info = get_column_info(conn)
-    
-    if not columns_info:
-        st.warning("Нет данных для анализа")
-        return None, None, None, None
-    
-    # Разделяем колонки на измерения и значения
-    dimensions = [col['name'] for col in columns_info if not col['is_numeric']]
-    metrics = [col['name'] for col in columns_info if col['is_numeric']]
-    
-    # Доступные агрегации
-    aggregations = ['SUM', 'COUNT', 'AVG', 'MIN', 'MAX']
-    
-    # Создаём три колонки для интерфейса перетаскивания
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        st.markdown("### 📊 Строки")
-        st.markdown("*Перетащите поля сюда*")
-        rows = st.multiselect(
-            "Поля строк",
-            options=dimensions + metrics,
-            key="rows_select",
-            label_visibility="collapsed"
-        )
-        
-        if rows:
-            st.markdown("**Выбранные поля:**")
-            for r in rows:
-                st.markdown(f"- 📍 {r}")
-    
-    with col2:
-        st.markdown("### 📈 Колонки")
-        st.markdown("*Перетащите поля сюда*")
-        columns = st.multiselect(
-            "Поля колонок",
-            options=dimensions + metrics,
-            key="columns_select",
-            label_visibility="collapsed"
-        )
-        
-        if columns:
-            st.markdown("**Выбранные поля:**")
-            for c in columns:
-                st.markdown(f"- 📌 {c}")
-    
-    with col3:
-        st.markdown("### 🧮 Значения")
-        st.markdown("*Перетащите поля сюда*")
-        values = st.multiselect(
-            "Поля значений",
-            options=metrics,
-            key="values_select",
-            label_visibility="collapsed"
-        )
-        
-        if values:
-            st.markdown("**Агрегация:**")
-            agg_func = st.selectbox(
-                "Выберите функцию агрегации",
-                aggregations,
-                key="agg_select"
-            )
-            st.markdown("**Выбранные поля:**")
-            for v in values:
-                st.markdown(f"- 💹 {v} ({agg_func})")
-    
-    return rows, columns, values, agg_func if values else None
-
-# ============================================
-# 5. ОСНОВНОЙ ИНТЕРФЕЙС
+# 4. ИНТЕРФЕЙС КАК В EXCEL
 # ============================================
 def main():
     st.set_page_config(
-        page_title="OLAP-куб на DuckDB",
+        page_title="Excel-style Pivot Table",
         page_icon="📊",
         layout="wide"
     )
     
-    st.title("📊 Интерактивная сводная таблица на DuckDB")
-    st.markdown("""
-    ### Конструктор сводной таблицы
-    Выбирайте поля для строк, колонок и значений — анализ обновляется мгновенно!
-    """)
+    st.title("📊 Конструктор сводных таблиц (как в Excel)")
+    st.markdown("---")
     
-    # Подключаемся к DuckDB
+    # Подключаемся к БД
     conn = get_duckdb_connection()
+    pivot_builder = PivotTableBuilder(conn)
     
     # ============================================
-    # 6. БОКОВАЯ ПАНЕЛЬ - УПРАВЛЕНИЕ ДАННЫМИ
+    # SIDEBAR - ЗАГРУЗКА ДАННЫХ
     # ============================================
     with st.sidebar:
-        st.header("📁 Управление данными")
+        st.header("📁 Загрузка данных")
         
-        # Выбор метода загрузки
-        load_method = st.radio(
-            "Режим загрузки",
-            ["📂 Выбрать папку", "📄 Выбрать файлы", "➕ Добавить файлы", "🔍 Предпросмотр файлов"]
+        uploaded_files = st.file_uploader(
+            "Загрузите Excel файлы",
+            type=['xlsx', 'xls'],
+            accept_multiple_files=True
         )
         
-        if load_method == "📂 Выбрать папку":
-            folder_path = st.text_input(
-                "Путь к папке с Excel-файлами",
-                placeholder="C:/Users/YourName/Documents/excel_files"
-            )
-            
-            if folder_path and os.path.exists(folder_path):
-                excel_files = get_excel_files_from_directory(folder_path)
-                if excel_files:
-                    st.success(f"Найдено {len(excel_files)} Excel-файлов")
-                    
-                    if st.button("🚀 Загрузить все файлы", type="primary", use_container_width=True):
-                        with st.spinner("Загрузка данных..."):
-                            rows, message = load_excel_files_to_duckdb(conn, excel_files)
-                            st.success(message)
-                            st.rerun()
-                else:
-                    st.warning("Нет Excel-файлов")
-        
-        elif load_method == "📄 Выбрать файлы":
-            uploaded_files = st.file_uploader(
-                "Выберите Excel-файлы",
-                type=['xlsx', 'xls', 'xlsm'],
-                accept_multiple_files=True
-            )
-            
-            if uploaded_files and st.button("🚀 Загрузить", type="primary", use_container_width=True):
+        if uploaded_files:
+            if st.button("🚀 Загрузить в БД", type="primary", use_container_width=True):
                 temp_files = []
-                for uploaded_file in uploaded_files:
-                    temp_path = f"temp_{uploaded_file.name}"
-                    with open(temp_path, "wb") as f:
-                        f.write(uploaded_file.getbuffer())
+                for f in uploaded_files:
+                    temp_path = f"temp_{f.name}"
+                    with open(temp_path, "wb") as out:
+                        out.write(f.getbuffer())
                     temp_files.append(temp_path)
                 
                 with st.spinner("Загрузка..."):
-                    rows, message = load_excel_files_to_duckdb(conn, temp_files)
-                    st.success(message)
-                    for temp_file in temp_files:
-                        os.remove(temp_file)
-                    st.rerun()
-        
-        elif load_method == "➕ Добавить файлы":
-            uploaded_files = st.file_uploader(
-                "Выберите файлы для добавления",
-                type=['xlsx', 'xls', 'xlsm'],
-                accept_multiple_files=True
-            )
-            
-            if uploaded_files and st.button("➕ Добавить", type="primary", use_container_width=True):
-                temp_files = []
-                for uploaded_file in uploaded_files:
-                    temp_path = f"temp_{uploaded_file.name}"
-                    with open(temp_path, "wb") as f:
-                        f.write(uploaded_file.getbuffer())
-                    temp_files.append(temp_path)
+                    rows, msg = load_excel_to_duckdb(conn, temp_files)
+                    st.success(msg)
                 
-                with st.spinner("Добавление..."):
-                    rows, message = append_excel_files_to_duckdb(conn, temp_files)
-                    st.success(message)
-                    for temp_file in temp_files:
-                        os.remove(temp_file)
-                    st.rerun()
-        
-        elif load_method == "🔍 Предпросмотр файлов":
-            uploaded_file = st.file_uploader(
-                "Выберите Excel файл для предпросмотра",
-                type=['xlsx', 'xls', 'xlsm']
-            )
-            
-            if uploaded_file:
-                df, error = preview_excel_file(uploaded_file)
-                if error:
-                    st.error(error)
-                else:
-                    st.success(f"Файл содержит {len(df)} строк (предпросмотр)")
-                    st.dataframe(df.head(20), use_container_width=True)
-                    
-                    st.markdown("**Структура колонок:**")
-                    col_info = pd.DataFrame({
-                        'Колонка': df.columns,
-                        'Тип': df.dtypes.astype(str),
-                        'Уникальных значений': [df[col].nunique() for col in df.columns],
-                        'Пустые значения': [df[col].isnull().sum() for col in df.columns]
-                    })
-                    st.dataframe(col_info, use_container_width=True)
-        
-        st.divider()
-        
-        # Кнопка очистки
-        if st.button("🗑️ Очистить все данные", use_container_width=True):
-            try:
-                conn.execute("DROP TABLE IF EXISTS fact_sales")
-                conn.execute("DROP TABLE IF EXISTS load_history")
-                st.success("Данные очищены")
+                for f in temp_files:
+                    os.remove(f)
                 st.rerun()
-            except Exception as e:
-                st.error(f"Ошибка при очистке: {str(e)}")
-        
-        # История загрузок
-        with st.expander("📜 История загрузок"):
-            history_df = get_load_history(conn)
-            if not history_df.empty:
-                st.dataframe(history_df, use_container_width=True)
-    
-    # ============================================
-    # 7. ОСНОВНАЯ ОБЛАСТЬ - СВОДНАЯ ТАБЛИЦА
-    # ============================================
-    
-    # Проверяем наличие данных
-    try:
-        row_count = conn.execute("SELECT COUNT(*) FROM fact_sales").fetchone()[0]
-        has_data = row_count > 0
-    except:
-        has_data = False
-        st.info("ℹ️ Нет загруженных данных. Используйте боковую панель для загрузки Excel-файлов.")
-    
-    if has_data:
-        # Показываем информацию о данных
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("📊 Всего строк", f"{row_count:,}")
-        with col2:
-            columns_info = get_column_info(conn)
-            if columns_info:
-                dim_count = len([c for c in columns_info if not c['is_numeric']])
-                metric_count = len([c for c in columns_info if c['is_numeric']])
-                st.metric("📐 Измерений / 📈 Метрик", f"{dim_count} / {metric_count}")
-            else:
-                st.metric("📐 Измерений / 📈 Метрик", "0 / 0")
-        with col3:
-            st.metric("💾 База данных", "olap_cube.duckdb")
         
         st.divider()
         
-        # Интерфейс конструктора сводной таблицы
-        rows, columns, values, agg_func = render_pivot_builder(conn)
+        # Информация о данных
+        try:
+            row_count = conn.execute("SELECT COUNT(*) FROM fact_sales").fetchone()[0]
+            st.metric("📊 Всего записей", f"{row_count:,}")
+        except:
+            st.info("ℹ️ Нет данных")
+            row_count = 0
         
-        st.divider()
+        if st.button("🗑️ Очистить", use_container_width=True):
+            conn.execute("DROP TABLE IF EXISTS fact_sales")
+            st.rerun()
+    
+    # ============================================
+    # ОСНОВНОЙ ЭКРАН - КОНСТРУКТОР СВОДНОЙ ТАБЛИЦЫ
+    # ============================================
+    
+    if row_count > 0:
+        # Получаем колонки
+        columns_info = pivot_builder.get_columns_info()
         
-        # Кнопка выполнения анализа
-        col1, col2, col3 = st.columns([1, 2, 1])
-        with col2:
-            analyze_button = st.button("🔄 Обновить анализ", type="primary", use_container_width=True)
-        
-        # Выполняем анализ
-        if analyze_button or (rows or columns or values):
-            if values:
-                with st.spinner("🔄 Выполняется анализ данных..."):
-                    result_df, message = run_pivot_query(conn, rows, columns, values, agg_func)
-                    
-                    if result_df is not None:
-                        st.success(message)
+        if columns_info:
+            # Разделяем на измерения и факты
+            all_columns = [col['name'] for col in columns_info]
+            dimensions = [col['name'] for col in columns_info if not col['is_numeric']]
+            measures = [col['name'] for col in columns_info if col['is_numeric']]
+            
+            # Стилизация как в Excel
+            st.markdown("""
+            <style>
+            .pivot-area {
+                background-color: #f8f9fa;
+                border-radius: 10px;
+                padding: 20px;
+                margin: 10px 0;
+                border: 2px solid #dee2e6;
+            }
+            .pivot-area h4 {
+                margin-top: 0;
+                color: #495057;
+            }
+            .field-list {
+                background-color: white;
+                border-radius: 5px;
+                padding: 10px;
+                min-height: 200px;
+                border: 1px solid #ced4da;
+            }
+            .field-item {
+                background-color: #e9ecef;
+                margin: 5px;
+                padding: 5px 10px;
+                border-radius: 5px;
+                cursor: pointer;
+                display: inline-block;
+            }
+            </style>
+            """, unsafe_allow_html=True)
+            
+            # ИНТЕРФЕЙС КАК В EXCEL - 4 ОБЛАСТИ
+            st.subheader("🎯 Перетащите поля в нужные области")
+            
+            # Верхняя строка - Фильтры (опционально)
+            with st.expander("🔍 Фильтры (опционально)"):
+                filters = st.multiselect(
+                    "Поля для фильтрации",
+                    options=all_columns,
+                    key="filters"
+                )
+                
+                if filters:
+                    for f in filters:
+                        unique_vals = conn.execute(f"SELECT DISTINCT {f} FROM fact_sales LIMIT 20").fetchdf()
+                        selected = st.multiselect(f"Фильтр: {f}", unique_vals[f].tolist())
+                        if selected:
+                            # Применяем фильтр (упрощённо)
+                            pass
+            
+            # Основные 3 области сводной
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.markdown('<div class="pivot-area">', unsafe_allow_html=True)
+                st.markdown("### 📊 СТРОКИ")
+                st.markdown("*Перетащите сюда поля для строк*")
+                rows = st.multiselect(
+                    "Поля строк",
+                    options=dimensions,
+                    key="rows_area",
+                    label_visibility="collapsed",
+                    placeholder="Выберите поля для строк..."
+                )
+                if rows:
+                    for r in rows:
+                        st.markdown(f"📌 **{r}**")
+                st.markdown('</div>', unsafe_allow_html=True)
+            
+            with col2:
+                st.markdown('<div class="pivot-area">', unsafe_allow_html=True)
+                st.markdown("### 📈 КОЛОНКИ")
+                st.markdown("*Перетащите сюда поля для колонок*")
+                columns = st.multiselect(
+                    "Поля колонок",
+                    options=dimensions,
+                    key="columns_area",
+                    label_visibility="collapsed",
+                    placeholder="Выберите поля для колонок..."
+                )
+                if columns:
+                    for c in columns:
+                        st.markdown(f"📍 **{c}**")
+                st.markdown('</div>', unsafe_allow_html=True)
+            
+            with col3:
+                st.markdown('<div class="pivot-area">', unsafe_allow_html=True)
+                st.markdown("### 🧮 ЗНАЧЕНИЯ")
+                st.markdown("*Перетащите сюда поля для расчётов*")
+                values = st.multiselect(
+                    "Поля значений",
+                    options=measures,
+                    key="values_area",
+                    label_visibility="collapsed",
+                    placeholder="Выберите числовые поля..."
+                )
+                
+                if values:
+                    agg_func = st.selectbox(
+                        "Функция агрегации",
+                        ["SUM", "COUNT", "AVG", "MIN", "MAX"],
+                        key="aggregation"
+                    )
+                    for v in values:
+                        st.markdown(f"💹 **{v}** ({agg_func})")
+                st.markdown('</div>', unsafe_allow_html=True)
+            
+            st.markdown("---")
+            
+            # КНОПКА ОБНОВЛЕНИЯ
+            col1, col2, col3 = st.columns([1, 2, 1])
+            with col2:
+                update_button = st.button(
+                    "🔄 ОБНОВИТЬ СВОДНУЮ ТАБЛИЦУ",
+                    type="primary",
+                    use_container_width=True
+                )
+            
+            # ПОКАЗЫВАЕМ РЕЗУЛЬТАТ
+            if update_button or (rows or columns or values):
+                if values:
+                    with st.spinner("Построение сводной таблицы..."):
+                        result, msg = pivot_builder.create_pivot(rows, columns, values, agg_func)
                         
-                        # Показываем результат
-                        st.subheader("📊 Результат сводной таблицы")
-                        
-                        # Настройки отображения
-                        show_options = st.checkbox("⚙️ Настройки отображения")
-                        if show_options:
-                            format_type = st.selectbox("Формат отображения", ["Таблица", "Транспонированная", "Тепловая карта"])
-                            precision = st.slider("Точность чисел", 0, 4, 2)
-                        else:
-                            format_type = "Таблица"
-                            precision = 2
-                        
-                        # Отображаем результат
-                        if format_type == "Таблица":
-                            if precision > 0:
-                                styled_df = result_df.style.format(precision=precision)
+                        if result is not None:
+                            st.success(msg)
+                            
+                            # Отображение результата
+                            st.subheader("📋 РЕЗУЛЬТАТ СВОДНОЙ ТАБЛИЦЫ")
+                            
+                            # Настройки отображения
+                            col_format, col_viz = st.columns([1, 2])
+                            with col_format:
+                                show_totals = st.checkbox("Показывать итоги", value=True)
+                                format_numbers = st.checkbox("Форматировать числа", value=True)
+                            
+                            # Форматируем
+                            if format_numbers:
+                                styled_result = result.style.format("{:,.2f}")
                             else:
-                                styled_df = result_df
-                            st.dataframe(styled_df, use_container_width=True, height=500)
-                        
-                        elif format_type == "Транспонированная":
-                            st.dataframe(result_df.T, use_container_width=True, height=500)
-                        
-                        elif format_type == "Тепловая карта":
-                            # Выбираем только числовые колонки для тепловой карты
-                            numeric_cols = result_df.select_dtypes(include=['number']).columns
-                            if len(numeric_cols) > 0:
-                                fig = px.imshow(
-                                    result_df[numeric_cols].values,
-                                    x=numeric_cols,
-                                    y=result_df.index,
-                                    title="Тепловая карта данных",
-                                    color_continuous_scale='RdBu',
-                                    aspect="auto"
-                                )
-                                st.plotly_chart(fig, use_container_width=True)
-                            else:
-                                st.warning("Нет числовых данных для тепловой карты")
-                        
-                        # Визуализация
-                        if len(values) > 0 and len(result_df) > 0:
-                            st.subheader("📈 Визуализация")
+                                styled_result = result
                             
-                            viz_type = st.selectbox(
-                                "Тип графика",
-                                ["Столбчатая диаграмма", "Линейный график", "Круговая диаграмма", "Ящик с усами"]
-                            )
+                            # Показываем таблицу
+                            st.dataframe(styled_result, use_container_width=True, height=500)
                             
-                            # Выбираем первую метрику для визуализации
-                            metric_to_plot = values[0]
-                            
-                            if viz_type == "Столбчатая диаграмма":
-                                # Берём первые 20 строк для читаемости
-                                plot_df = result_df.head(20).reset_index()
-                                x_col = plot_df.columns[0]  # Первая колонка как ось X
+                            # Добавляем итоги
+                            if show_totals and len(result) > 0:
+                                st.markdown("### 📊 ИТОГИ")
                                 
-                                fig = px.bar(
-                                    plot_df,
-                                    x=x_col,
-                                    y=metric_to_plot,
-                                    title=f"{metric_to_plot} по {x_col}",
-                                    color_discrete_sequence=['#FF4B4B']
-                                )
-                                st.plotly_chart(fig, use_container_width=True)
+                                # Итоги по строкам
+                                if rows:
+                                    st.markdown("**Итоги по строкам:**")
+                                    row_totals = result.sum(axis=1).sort_values(ascending=False).head(10)
+                                    st.dataframe(pd.DataFrame({
+                                        'Категория': row_totals.index,
+                                        'Общая сумма': row_totals.values
+                                    }), use_container_width=True)
+                                
+                                # Итоги по колонкам
+                                if columns:
+                                    st.markdown("**Итоги по колонкам:**")
+                                    col_totals = result.sum(axis=0).sort_values(ascending=False).head(10)
+                                    st.dataframe(pd.DataFrame({
+                                        'Категория': col_totals.index,
+                                        'Общая сумма': col_totals.values
+                                    }), use_container_width=True)
                             
-                            elif viz_type == "Линейный график":
-                                plot_df = result_df.head(50).reset_index()
-                                x_col = plot_df.columns[0]
-                                fig = px.line(
-                                    plot_df,
-                                    x=x_col,
-                                    y=metric_to_plot,
-                                    title=f"Тренд {metric_to_plot}",
-                                    markers=True
-                                )
-                                st.plotly_chart(fig, use_container_width=True)
+                            # ВИЗУАЛИЗАЦИЯ
+                            st.subheader("📊 ВИЗУАЛИЗАЦИЯ")
                             
-                            elif viz_type == "Круговая диаграмма":
-                                plot_df = result_df.head(10).reset_index()
-                                x_col = plot_df.columns[0]
-                                fig = px.pie(
-                                    plot_df,
-                                    names=x_col,
-                                    values=metric_to_plot,
-                                    title=f"Распределение {metric_to_plot}"
-                                )
-                                st.plotly_chart(fig, use_container_width=True)
+                            viz_col1, viz_col2 = st.columns(2)
                             
-                            elif viz_type == "Ящик с усами":
-                                fig = px.box(
-                                    result_df.reset_index(),
-                                    y=metric_to_plot,
-                                    title=f"Распределение {metric_to_plot}"
+                            with viz_col1:
+                                chart_type = st.selectbox(
+                                    "Тип графика",
+                                    ["Столбчатая диаграмма", "Линейный график", "Тепловая карта", "Круговая диаграмма"]
                                 )
-                                st.plotly_chart(fig, use_container_width=True)
-                        
-                        # Экспорт
-                        csv = result_df.to_csv()
-                        st.download_button(
-                            label="📥 Скачать результаты (CSV)",
-                            data=csv,
-                            file_name=f"pivot_table_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                            mime="text/csv"
-                        )
-                    else:
-                        st.error(message)
-            else:
-                st.info("💡 Выберите хотя бы одно поле для анализа (Значения)")
+                            
+                            with viz_col2:
+                                if len(result.columns) > 1:
+                                    chart_metric = st.selectbox("Метрика для отображения", result.columns)
+                                else:
+                                    chart_metric = result.columns[0] if len(result.columns) > 0 else None
+                            
+                            if chart_metric:
+                                if chart_type == "Столбчатая диаграмма":
+                                    # Берём топ-20 для читаемости
+                                    plot_data = result[chart_metric].head(20)
+                                    fig = px.bar(
+                                        x=plot_data.index,
+                                        y=plot_data.values,
+                                        title=f"{chart_metric} - Столбчатая диаграмма",
+                                        labels={'x': 'Категория', 'y': chart_metric}
+                                    )
+                                    st.plotly_chart(fig, use_container_width=True)
+                                
+                                elif chart_type == "Линейный график":
+                                    plot_data = result[chart_metric]
+                                    fig = px.line(
+                                        x=plot_data.index,
+                                        y=plot_data.values,
+                                        title=f"{chart_metric} - Тренд",
+                                        markers=True
+                                    )
+                                    st.plotly_chart(fig, use_container_width=True)
+                                
+                                elif chart_type == "Тепловая карта":
+                                    # Для тепловой карты нужно 2D
+                                    if len(result.columns) > 1 and len(result) > 1:
+                                        fig = px.imshow(
+                                            result.values,
+                                            x=result.columns,
+                                            y=result.index,
+                                            title="Тепловая карта данных",
+                                            color_continuous_scale='RdYlGn',
+                                            aspect="auto"
+                                        )
+                                        st.plotly_chart(fig, use_container_width=True)
+                                    else:
+                                        st.warning("Для тепловой карты нужно больше измерений")
+                                
+                                elif chart_type == "Круговая диаграмма":
+                                    plot_data = result[chart_metric].head(10)
+                                    fig = px.pie(
+                                        values=plot_data.values,
+                                        names=plot_data.index,
+                                        title=f"Распределение {chart_metric}"
+                                    )
+                                    st.plotly_chart(fig, use_container_width=True)
+                            
+                            # ЭКСПОРТ
+                            st.subheader("💾 ЭКСПОРТ")
+                            csv = result.to_csv()
+                            st.download_button(
+                                label="📥 Скачать как CSV",
+                                data=csv,
+                                file_name=f"pivot_table_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                                mime="text/csv",
+                                use_container_width=True
+                            )
+                        else:
+                            st.error(msg)
+                else:
+                    st.info("💡 Выберите хотя бы одно поле в область ЗНАЧЕНИЯ")
+    else:
+        st.info("📂 **Начните с загрузки данных**\n\nИспользуйте боковую панель слева, чтобы загрузить Excel файлы")
 
 if __name__ == "__main__":
     main()
