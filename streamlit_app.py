@@ -307,32 +307,49 @@ class OLAPManager:
     
     def _init_users_tables(self):
         """Инициализация таблиц пользователей и прав"""
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY,
-                username VARCHAR UNIQUE,
-                password_hash VARCHAR,
-                role VARCHAR,
-                created_at TIMESTAMP,
-                last_login TIMESTAMP
-            )
-        """)
-        
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS permissions (
-                id INTEGER PRIMARY KEY,
-                user_role VARCHAR,
-                cube_name VARCHAR,
-                access_level VARCHAR  -- 'READ', 'WRITE', 'ADMIN'
-            )
-        """)
-        
-        # Создаем админа по умолчанию
-        admin_hash = hashlib.sha256("admin123".encode()).hexdigest()
-        self.conn.execute("""
-            INSERT OR IGNORE INTO users (username, password_hash, role, created_at)
-            VALUES ('admin', ?, 'ADMIN', CURRENT_TIMESTAMP)
-        """, [admin_hash])
+        try:
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY,
+                    username VARCHAR UNIQUE,
+                    password_hash VARCHAR,
+                    role VARCHAR,
+                    created_at TIMESTAMP,
+                    last_login TIMESTAMP
+                )
+            """)
+            
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS permissions (
+                    id INTEGER PRIMARY KEY,
+                    user_role VARCHAR,
+                    cube_name VARCHAR,
+                    access_level VARCHAR,
+                    UNIQUE(user_role, cube_name)
+                )
+            """)
+            
+            # Проверяем, существует ли уже admin
+            admin_exists = self.conn.execute(
+                "SELECT COUNT(*) FROM users WHERE username = 'admin'"
+            ).fetchone()[0]
+            
+            # Создаем админа по умолчанию только если его нет
+            if admin_exists == 0:
+                admin_hash = hashlib.sha256("admin123".encode()).hexdigest()
+                self.conn.execute("""
+                    INSERT INTO users (username, password_hash, role, created_at)
+                    VALUES ('admin', ?, 'ADMIN', CURRENT_TIMESTAMP)
+                """, [admin_hash])
+                
+                # Даем админу все права
+                self.conn.execute("""
+                    INSERT OR IGNORE INTO permissions (user_role, cube_name, access_level)
+                    VALUES ('ADMIN', '*', 'ADMIN')
+                """)
+        except Exception as e:
+            # Игнорируем ошибки инициализации, если таблицы уже существуют
+            pass
     
     def _init_partitions(self):
         """Инициализация системы партиционирования"""
@@ -374,7 +391,7 @@ class OLAPManager:
         for col in df.columns:
             if df[col].nunique() < 1000:  # Индексируем колонки с малым числом уникальных значений
                 try:
-                    self.conn.execute(f"CREATE INDEX idx_{table_name}_{col} ON {table_name}({col})")
+                    self.conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_{col} ON {table_name}({col})")
                 except:
                     pass
         
@@ -415,6 +432,34 @@ class OLAPManager:
             INSERT OR REPLACE INTO olap_cubes (name, table_name, definition, updated_at, owner)
             VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?)
         """, [cube.name, cube.table_name, json.dumps(definition), current_user])
+    
+    def slice_dice(self, cube_name: str, rows: List[str], cols: List[str], 
+                   measures: List[str], filters: Dict = None) -> pd.DataFrame:
+        """Операция slice and dice"""
+        dimensions = list(set(rows + cols))
+        measures_with_agg = [(m, self.cubes[cube_name].measures[m].default_agg) for m in measures]
+        
+        df = self.query_cube(cube_name, dimensions, measures_with_agg, filters)
+        
+        if df.empty:
+            return df
+        
+        # Создаем сводную таблицу
+        if rows and cols:
+            pivot_df = df.pivot_table(
+                index=rows,
+                columns=cols,
+                values=measures,
+                aggfunc='sum',
+                fill_value=0
+            )
+            return pivot_df
+        elif rows:
+            return df.groupby(rows)[measures].sum().reset_index()
+        elif cols:
+            return df.groupby(cols)[measures].sum().reset_index()
+        else:
+            return df[measures].sum().to_frame().T
     
     @st.cache_data(ttl=3600)
     def query_cube_cached(_self, cube_name: str, dimensions: List[str], 
@@ -515,14 +560,18 @@ class OLAPManager:
             query += f" LIMIT {top_n}"
         
         # Выполняем запрос
-        result = self.conn.execute(query).fetchdf()
+        try:
+            result = self.conn.execute(query).fetchdf()
+        except Exception as e:
+            st.error(f"Ошибка выполнения запроса: {e}")
+            result = pd.DataFrame()
         
         # Сохраняем в историю
         execution_time = (datetime.now() - start_time).total_seconds()
         self._log_query(cube_name, query, execution_time, len(result))
         
         # Кэшируем результат
-        if use_cache:
+        if use_cache and not result.empty:
             self.query_cache.set(cache_key, result)
         
         return result
@@ -530,24 +579,30 @@ class OLAPManager:
     def _log_query(self, cube_name: str, query: str, execution_time: float, rows: int):
         """Логирование запросов для оптимизации"""
         current_user = st.session_state.get('username', 'anonymous')
-        self.conn.execute("""
-            INSERT INTO query_history (cube_name, query_text, execution_time, rows_returned, timestamp, user_name)
-            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
-        """, [cube_name, query[:1000], execution_time, rows, current_user])
+        try:
+            self.conn.execute("""
+                INSERT INTO query_history (cube_name, query_text, execution_time, rows_returned, timestamp, user_name)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+            """, [cube_name, query[:1000], execution_time, rows, current_user])
+        except:
+            pass
     
     def get_query_performance_stats(self) -> pd.DataFrame:
         """Статистика производительности запросов"""
-        return self.conn.execute("""
-            SELECT 
-                cube_name,
-                COUNT(*) as query_count,
-                AVG(execution_time) as avg_time,
-                MAX(execution_time) as max_time,
-                AVG(rows_returned) as avg_rows
-            FROM query_history
-            GROUP BY cube_name
-            ORDER BY avg_time DESC
-        """).fetchdf()
+        try:
+            return self.conn.execute("""
+                SELECT 
+                    cube_name,
+                    COUNT(*) as query_count,
+                    AVG(execution_time) as avg_time,
+                    MAX(execution_time) as max_time,
+                    AVG(rows_returned) as avg_rows
+                FROM query_history
+                GROUP BY cube_name
+                ORDER BY avg_time DESC
+            """).fetchdf()
+        except:
+            return pd.DataFrame()
     
     def create_materialized_view(self, cube_name: str, view_name: str, 
                                  dimensions: List[str], measures: List[str]):
@@ -573,19 +628,22 @@ class UserManager:
     def authenticate(self, username: str, password: str) -> bool:
         """Аутентификация пользователя"""
         password_hash = hashlib.sha256(password.encode()).hexdigest()
-        result = self.conn.execute("""
-            SELECT role FROM users 
-            WHERE username = ? AND password_hash = ?
-        """, [username, password_hash]).fetchone()
-        
-        if result:
-            self.conn.execute("""
-                UPDATE users SET last_login = CURRENT_TIMESTAMP 
-                WHERE username = ?
-            """, [username])
-            st.session_state.username = username
-            st.session_state.role = result[0]
-            return True
+        try:
+            result = self.conn.execute("""
+                SELECT role FROM users 
+                WHERE username = ? AND password_hash = ?
+            """, [username, password_hash]).fetchone()
+            
+            if result:
+                self.conn.execute("""
+                    UPDATE users SET last_login = CURRENT_TIMESTAMP 
+                    WHERE username = ?
+                """, [username])
+                st.session_state.username = username
+                st.session_state.role = result[0]
+                return True
+        except:
+            pass
         return False
     
     def create_user(self, username: str, password: str, role: str = 'VIEWER') -> bool:
@@ -615,25 +673,31 @@ class UserManager:
             return True
         
         # Проверяем права
-        result = self.conn.execute("""
-            SELECT access_level FROM permissions 
-            WHERE user_role = ? AND cube_name = ?
-        """, [role, cube_name]).fetchone()
-        
-        if not result:
+        try:
+            result = self.conn.execute("""
+                SELECT access_level FROM permissions 
+                WHERE user_role = ? AND (cube_name = ? OR cube_name = '*')
+            """, [role, cube_name]).fetchone()
+            
+            if not result:
+                return False
+            
+            access_level = result[0]
+            levels = {'READ': 1, 'WRITE': 2, 'ADMIN': 3}
+            return levels.get(access_level, 0) >= levels.get(required_level, 1)
+        except:
             return False
-        
-        access_level = result[0]
-        levels = {'READ': 1, 'WRITE': 2, 'ADMIN': 3}
-        return levels.get(access_level, 0) >= levels.get(required_level, 1)
     
     def get_users_list(self) -> pd.DataFrame:
         """Список пользователей"""
-        return self.conn.execute("""
-            SELECT username, role, created_at, last_login 
-            FROM users 
-            ORDER BY created_at DESC
-        """).fetchdf()
+        try:
+            return self.conn.execute("""
+                SELECT username, role, created_at, last_login 
+                FROM users 
+                ORDER BY created_at DESC
+            """).fetchdf()
+        except:
+            return pd.DataFrame()
 
 # ============================================
 # 7. ВИЗУАЛИЗАЦИИ И ДАШБОРДЫ
@@ -826,35 +890,35 @@ class OLAPAPI:
         }
 
 # ============================================
-# 9. ОСНОВНОЙ ИНТЕРФЕЙС
+# 9. ОСНОВНОЙ ИНТЕРФЕЙС (ИСПРАВЛЕННЫЙ)
 # ============================================
 class OLAPInterface:
     def __init__(self):
-    self.conn = get_connection()
-    
-    # ВРЕМЕННО: Сброс БД при проблемах
-    if 'db_initialized' not in st.session_state:
-        try:
-            # Удаляем старые таблицы если они есть проблемы
-            self.conn.execute("DROP TABLE IF EXISTS users")
-            self.conn.execute("DROP TABLE IF EXISTS permissions")
-            self.conn.execute("DROP TABLE IF EXISTS olap_cubes")
-            self.conn.execute("DROP TABLE IF EXISTS olap_slices")
-            self.conn.execute("DROP TABLE IF EXISTS query_history")
-            self.conn.execute("DROP TABLE IF EXISTS table_partitions")
-            st.session_state.db_initialized = True
-        except:
-            pass
-    
-    self.olap_manager = OLAPManager(self.conn)
-    self.user_manager = UserManager(self.conn)
-    self.dashboard_manager = DashboardManager(self.olap_manager)
-    self.api = OLAPAPI(self.olap_manager)
-    
-    if 'current_cube' not in st.session_state:
-        st.session_state.current_cube = None
-    if 'authenticated' not in st.session_state:
-        st.session_state.authenticated = False
+        self.conn = get_connection()
+        
+        # ВРЕМЕННО: Сброс БД при проблемах
+        if 'db_initialized' not in st.session_state:
+            try:
+                # Удаляем старые таблицы если они есть проблемы
+                self.conn.execute("DROP TABLE IF EXISTS users")
+                self.conn.execute("DROP TABLE IF EXISTS permissions")
+                self.conn.execute("DROP TABLE IF EXISTS olap_cubes")
+                self.conn.execute("DROP TABLE IF EXISTS olap_slices")
+                self.conn.execute("DROP TABLE IF EXISTS query_history")
+                self.conn.execute("DROP TABLE IF EXISTS table_partitions")
+                st.session_state.db_initialized = True
+            except:
+                pass
+        
+        self.olap_manager = OLAPManager(self.conn)
+        self.user_manager = UserManager(self.conn)
+        self.dashboard_manager = DashboardManager(self.olap_manager)
+        self.api = OLAPAPI(self.olap_manager)
+        
+        if 'current_cube' not in st.session_state:
+            st.session_state.current_cube = None
+        if 'authenticated' not in st.session_state:
+            st.session_state.authenticated = False
     
     def render_login_page(self):
         """Страница входа"""
