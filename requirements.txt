@@ -1,1 +1,7 @@
-pip install streamlit duckdb pandas plotly numpy openpyxl pyarrow
+streamlit 
+duckdb
+pandas
+plotly
+numpy
+openpyxl
+pyarrow
