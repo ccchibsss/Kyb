@@ -8,28 +8,39 @@ import glob
 from datetime import datetime
 
 # ============================================
-# 1. НАСТРОЙКА ПОДКЛЮЧЕНИЯ К DUCKDB
+# 1. НАСТРОЙКА ПОДКЛЮЧЕНИЯ К DUCKDB (БЕЗ SPATIAL)
 # ============================================
 @st.cache_resource
 def get_duckdb_connection():
     """Создаёт или открывает persistent-базу данных"""
-    conn = duckdb.connect('olap_cube.duckdb')
-    
-    conn.execute("INSTALL spatial IF NOT EXISTS")
-    conn.execute("LOAD spatial")
-    
-    # Создаём таблицу для логирования обновлений
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS load_history (
-            id INTEGER PRIMARY KEY,
-            load_date TIMESTAMP,
-            file_path VARCHAR,
-            rows_loaded INTEGER,
-            status VARCHAR
-        )
-    """)
-    
-    return conn
+    try:
+        conn = duckdb.connect('olap_cube.duckdb')
+        
+        # Пытаемся установить расширение, но обрабатываем ошибку
+        try:
+            conn.execute("INSTALL spatial IF NOT EXISTS")
+            conn.execute("LOAD spatial")
+            st.success("✅ Spatial extension loaded")
+        except Exception as e:
+            # Если не получилось - просто продолжаем без spatial
+            st.warning("⚠️ Spatial extension not available (this is fine for basic OLAP)")
+        
+        # Создаём таблицу для логирования обновлений
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS load_history (
+                id INTEGER PRIMARY KEY,
+                load_date TIMESTAMP,
+                file_path VARCHAR,
+                rows_loaded INTEGER,
+                status VARCHAR
+            )
+        """)
+        
+        return conn
+    except Exception as e:
+        st.error(f"Failed to connect to database: {str(e)}")
+        # Создаём in-memory соединение как fallback
+        return duckdb.connect(':memory:')
 
 # ============================================
 # 2. ФУНКЦИИ ДЛЯ РАБОТЫ С ФАЙЛАМИ
@@ -110,40 +121,59 @@ def append_excel_files_to_duckdb(conn, file_paths, table_name='fact_sales'):
 
 def get_load_history(conn):
     """Получает историю загрузок"""
-    return conn.execute("""
-        SELECT 
-            load_date,
-            file_path,
-            rows_loaded,
-            status
-        FROM load_history 
-        ORDER BY load_date DESC
-        LIMIT 50
-    """).fetchdf()
+    try:
+        return conn.execute("""
+            SELECT 
+                load_date,
+                file_path,
+                rows_loaded,
+                status
+            FROM load_history 
+            ORDER BY load_date DESC
+            LIMIT 50
+        """).fetchdf()
+    except:
+        return pd.DataFrame()
 
 # ============================================
 # 3. OLAP-ФУНКЦИИ С ПОДДЕРЖКОЙ АГРЕГАЦИЙ
 # ============================================
 def get_column_info(conn, table_name='fact_sales'):
     """Получает информацию о колонках таблицы"""
-    columns_df = conn.execute(f"DESCRIBE {table_name}").fetchdf()
-    
-    numeric_types = ['INTEGER', 'BIGINT', 'DOUBLE', 'FLOAT', 'DECIMAL', 'REAL']
-    
-    columns = []
-    for _, row in columns_df.iterrows():
-        col_name = row['column_name']
-        col_type = row['column_type'].upper()
-        is_numeric = any(nt in col_type for nt in numeric_types)
+    try:
+        # Проверяем существует ли таблица
+        tables = conn.execute("SHOW TABLES").fetchdf()
+        if table_name not in tables['name'].values:
+            return []
         
-        columns.append({
-            'name': col_name,
-            'type': col_type,
-            'is_numeric': is_numeric,
-            'sample': conn.execute(f"SELECT {col_name} FROM {table_name} LIMIT 1").fetchone()[0] if is_numeric else None
-        })
-    
-    return columns
+        columns_df = conn.execute(f"DESCRIBE {table_name}").fetchdf()
+        
+        numeric_types = ['INTEGER', 'BIGINT', 'DOUBLE', 'FLOAT', 'DECIMAL', 'REAL']
+        
+        columns = []
+        for _, row in columns_df.iterrows():
+            col_name = row['column_name']
+            col_type = row['column_type'].upper()
+            is_numeric = any(nt in col_type for nt in numeric_types)
+            
+            # Безопасно получаем sample
+            try:
+                sample = conn.execute(f"SELECT {col_name} FROM {table_name} LIMIT 1").fetchone()
+                sample_value = sample[0] if sample else None
+            except:
+                sample_value = None
+            
+            columns.append({
+                'name': col_name,
+                'type': col_type,
+                'is_numeric': is_numeric,
+                'sample': sample_value
+            })
+        
+        return columns
+    except Exception as e:
+        st.error(f"Error getting column info: {str(e)}")
+        return []
 
 def build_pivot_query(conn, rows, columns, values, agg_func='SUM', fact_table='fact_sales'):
     """Строит запрос для сводной таблицы с поддержкой иерархий"""
@@ -420,10 +450,13 @@ def main():
         
         # Кнопка очистки
         if st.button("🗑️ Очистить все данные", use_container_width=True):
-            conn.execute("DROP TABLE IF EXISTS fact_sales")
-            conn.execute("DROP TABLE IF EXISTS load_history")
-            st.success("Данные очищены")
-            st.rerun()
+            try:
+                conn.execute("DROP TABLE IF EXISTS fact_sales")
+                conn.execute("DROP TABLE IF EXISTS load_history")
+                st.success("Данные очищены")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Ошибка при очистке: {str(e)}")
         
         # История загрузок
         with st.expander("📜 История загрузок"):
@@ -450,9 +483,12 @@ def main():
             st.metric("📊 Всего строк", f"{row_count:,}")
         with col2:
             columns_info = get_column_info(conn)
-            dim_count = len([c for c in columns_info if not c['is_numeric']])
-            metric_count = len([c for c in columns_info if c['is_numeric']])
-            st.metric("📐 Измерений / 📈 Метрик", f"{dim_count} / {metric_count}")
+            if columns_info:
+                dim_count = len([c for c in columns_info if not c['is_numeric']])
+                metric_count = len([c for c in columns_info if c['is_numeric']])
+                st.metric("📐 Измерений / 📈 Метрик", f"{dim_count} / {metric_count}")
+            else:
+                st.metric("📐 Измерений / 📈 Метрик", "0 / 0")
         with col3:
             st.metric("💾 База данных", "olap_cube.duckdb")
         
@@ -491,7 +527,10 @@ def main():
                         
                         # Отображаем результат
                         if format_type == "Таблица":
-                            styled_df = result_df.style.format(precision=precision) if precision > 0 else result_df
+                            if precision > 0:
+                                styled_df = result_df.style.format(precision=precision)
+                            else:
+                                styled_df = result_df
                             st.dataframe(styled_df, use_container_width=True, height=500)
                         
                         elif format_type == "Транспонированная":
