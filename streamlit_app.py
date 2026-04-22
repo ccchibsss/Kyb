@@ -2,113 +2,552 @@ import streamlit as st
 import duckdb
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
+import plotly.figure_factory as ff
 import os
+import json
+import hashlib
+from datetime import datetime, timedelta
+from pathlib import Path
 import glob
-from datetime import datetime
+from typing import List, Dict, Any, Optional
+import numpy as np
+from scipy import stats
+import warnings
+warnings.filterwarnings('ignore')
 
 # ============================================
-# 1. ПОДКЛЮЧЕНИЕ К DUCKDB
+# 1. НАСТРОЙКА СТРАНИЦЫ И СТИЛИ
 # ============================================
-@st.cache_resource
-def get_duckdb_connection():
-    """Создаёт подключение к DuckDB"""
-    conn = duckdb.connect('olap_cube.duckdb')
+st.set_page_config(
+    page_title="Ultimate Pivot Analytics",
+    page_icon="🚀",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Профессиональный CSS дизайн
+st.markdown("""
+<style>
+    /* Главный фон */
+    .stApp {
+        background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+    }
     
-    # Создаём таблицу для логирования
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS load_history (
-            id INTEGER PRIMARY KEY,
-            load_date TIMESTAMP,
-            file_path VARCHAR,
-            rows_loaded INTEGER,
-            status VARCHAR
-        )
-    """)
+    /* Карточки */
+    .analytics-card {
+        background: white;
+        border-radius: 15px;
+        padding: 20px;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        margin: 10px 0;
+        transition: transform 0.3s;
+    }
+    .analytics-card:hover {
+        transform: translateY(-5px);
+        box-shadow: 0 8px 12px rgba(0,0,0,0.15);
+    }
     
-    return conn
+    /* Заголовки секций */
+    .section-header {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        padding: 15px;
+        border-radius: 10px;
+        margin: 20px 0;
+        font-size: 1.2em;
+        font-weight: bold;
+    }
+    
+    /* Метрики */
+    .metric-box {
+        background: linear-gradient(135deg, #84fab0 0%, #8fd3f4 100%);
+        border-radius: 10px;
+        padding: 15px;
+        text-align: center;
+        color: white;
+    }
+    
+    /* Кнопки */
+    .stButton > button {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        border: none;
+        border-radius: 10px;
+        padding: 10px 20px;
+        font-weight: bold;
+        transition: all 0.3s;
+    }
+    .stButton > button:hover {
+        transform: scale(1.05);
+        box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+    }
+    
+    /* Таблицы */
+    .dataframe {
+        border-radius: 10px;
+        overflow: hidden;
+    }
+    
+    /* Вкладки */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 8px;
+    }
+    .stTabs [data-baseweb="tab"] {
+        border-radius: 10px;
+        padding: 10px 20px;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+    }
+    
+    /* Боковая панель */
+    .css-1d391kg {
+        background: linear-gradient(180deg, #2c3e50 0%, #3498db 100%);
+    }
+    
+    /* Прогресс бар */
+    .stProgress > div > div {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    }
+</style>
+""", unsafe_allow_html=True)
 
 # ============================================
-# 2. РАБОТА С ФАЙЛАМИ
+# 2. УПРАВЛЕНИЕ ДАННЫМИ
 # ============================================
-def load_excel_to_duckdb(conn, file_paths, table_name='fact_sales'):
-    """Загружает Excel файлы в DuckDB"""
-    if not file_paths:
-        return 0, "Нет файлов"
+class DataManager:
+    def __init__(self):
+        self.conn = self.get_connection()
+        self.init_database()
     
-    total_rows = 0
-    first_file = True
+    @st.cache_resource
+    def get_connection(self):
+        """Создает подключение к DuckDB"""
+        return duckdb.connect('analytics_cube.duckdb')
     
-    for file_path in file_paths:
-        try:
-            df = pd.read_excel(file_path)
-            
-            if first_file:
-                conn.register('temp_df', df)
-                conn.execute(f"CREATE OR REPLACE TABLE {table_name} AS SELECT * FROM temp_df")
-                first_file = False
-            else:
-                conn.register('temp_df', df)
-                conn.execute(f"INSERT INTO {table_name} SELECT * FROM temp_df")
-            
-            total_rows += len(df)
-            
-            conn.execute("""
-                INSERT INTO load_history (load_date, file_path, rows_loaded, status)
-                VALUES (CURRENT_TIMESTAMP, ?, ?, 'SUCCESS')
-            """, [str(file_path), len(df)])
-        except Exception as e:
-            st.error(f"Ошибка загрузки {file_path}: {str(e)}")
-    
-    return total_rows, f"✅ Загружено {total_rows:,} строк"
-
-# ============================================
-# 3. НАСТОЯЩАЯ СВОДНАЯ ТАБЛИЦА
-# ============================================
-class PivotTableBuilder:
-    def __init__(self, conn, table_name='fact_sales'):
-        self.conn = conn
-        self.table_name = table_name
+    def init_database(self):
+        """Инициализирует базу данных и все таблицы"""
+        # Таблица для данных
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS fact_data (
+                id INTEGER PRIMARY KEY,
+                load_date TIMESTAMP,
+                source_file VARCHAR,
+                data_hash VARCHAR,
+                row_count INTEGER
+            )
+        """)
         
-    def get_columns_info(self):
-        """Получает список всех колонок и их типов"""
+        # Таблица для сохраненных отчетов
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS saved_reports (
+                id INTEGER PRIMARY KEY,
+                report_name VARCHAR,
+                report_date TIMESTAMP,
+                config JSON,
+                data_hash VARCHAR,
+                is_favorite BOOLEAN
+            )
+        """)
+        
+        # Таблица для истории загрузок
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS load_history (
+                id INTEGER PRIMARY KEY,
+                load_date TIMESTAMP,
+                file_name VARCHAR,
+                rows_loaded INTEGER,
+                status VARCHAR,
+                duration_seconds FLOAT
+            )
+        """)
+        
+        # Таблица для метаданных колонок
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS column_metadata (
+                column_name VARCHAR,
+                data_type VARCHAR,
+                category VARCHAR,
+                last_updated TIMESTAMP,
+                unique_values INTEGER,
+                null_percentage FLOAT
+            )
+        """)
+    
+    def load_excel_files(self, files, table_name='main_data'):
+        """Загружает Excel файлы с прогрессом и метаданными"""
+        if not files:
+            return 0, "Нет файлов"
+        
+        total_rows = 0
+        first_file = True
+        start_time = datetime.now()
+        
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        for idx, file in enumerate(files):
+            status_text.text(f"Загрузка {file.name}... ({idx+1}/{len(files)})")
+            
+            try:
+                df = pd.read_excel(file)
+                
+                # Оптимизация типов
+                for col in df.columns:
+                    if df[col].dtype == 'object':
+                        # Пробуем конвертировать в дату
+                        try:
+                            df[col] = pd.to_datetime(df[col])
+                        except:
+                            pass
+                        
+                        # Пробуем конвертировать в число
+                        try:
+                            df[col] = pd.to_numeric(df[col])
+                        except:
+                            pass
+                
+                if first_file:
+                    self.conn.register('temp_df', df)
+                    self.conn.execute(f"CREATE OR REPLACE TABLE {table_name} AS SELECT * FROM temp_df")
+                    first_file = False
+                else:
+                    self.conn.register('temp_df', df)
+                    self.conn.execute(f"INSERT INTO {table_name} SELECT * FROM temp_df")
+                
+                total_rows += len(df)
+                
+                # Сохраняем историю
+                self.conn.execute("""
+                    INSERT INTO load_history (load_date, file_name, rows_loaded, status, duration_seconds)
+                    VALUES (CURRENT_TIMESTAMP, ?, ?, 'SUCCESS', ?)
+                """, [file.name, len(df), 0])
+                
+                # Обновляем метаданные колонок
+                self.update_column_metadata(df)
+                
+            except Exception as e:
+                self.conn.execute("""
+                    INSERT INTO load_history (load_date, file_name, rows_loaded, status, duration_seconds)
+                    VALUES (CURRENT_TIMESTAMP, ?, ?, 'ERROR', ?)
+                """, [file.name, 0, 0])
+                st.error(f"Ошибка загрузки {file.name}: {str(e)}")
+            
+            progress_bar.progress((idx + 1) / len(files))
+        
+        duration = (datetime.now() - start_time).total_seconds()
+        status_text.text(f"✅ Загружено {total_rows:,} строк за {duration:.1f} сек")
+        progress_bar.empty()
+        
+        return total_rows, f"✅ Загружено {total_rows:,} строк из {len(files)} файлов"
+    
+    def update_column_metadata(self, df):
+        """Обновляет метаданные колонок"""
+        for col in df.columns:
+            # Определяем категорию колонки
+            if pd.api.types.is_numeric_dtype(df[col]):
+                category = 'metric'
+            elif pd.api.types.is_datetime64_any_dtype(df[col]):
+                category = 'date'
+            else:
+                category = 'dimension'
+            
+            unique_vals = df[col].nunique()
+            null_pct = (df[col].isnull().sum() / len(df)) * 100
+            
+            self.conn.execute("""
+                INSERT OR REPLACE INTO column_metadata 
+                (column_name, data_type, category, last_updated, unique_values, null_percentage)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?, ?)
+            """, [col, str(df[col].dtype), category, unique_vals, null_pct])
+    
+    def add_new_files(self, files, table_name='main_data'):
+        """Добавляет новые файлы к существующим данным"""
+        if not files:
+            return 0, "Нет файлов"
+        
+        total_rows = 0
+        
+        for file in files:
+            try:
+                df = pd.read_excel(file)
+                self.conn.register('temp_df', df)
+                self.conn.execute(f"INSERT INTO {table_name} SELECT * FROM temp_df")
+                total_rows += len(df)
+                
+                self.conn.execute("""
+                    INSERT INTO load_history (load_date, file_name, rows_loaded, status, duration_seconds)
+                    VALUES (CURRENT_TIMESTAMP, ?, ?, 'APPEND', 0)
+                """, [file.name, len(df)])
+                
+            except Exception as e:
+                st.error(f"Ошибка добавления {file.name}: {str(e)}")
+        
+        return total_rows, f"✅ Добавлено {total_rows:,} строк"
+    
+    def get_data_info(self, table_name='main_data'):
+        """Получает полную информацию о данных"""
         try:
             # Проверяем существование таблицы
             tables = self.conn.execute("SHOW TABLES").fetchdf()
-            if self.table_name not in tables['name'].values:
-                return []
+            if table_name not in tables['name'].values:
+                return None
             
-            # Получаем структуру таблицы
-            df_sample = self.conn.execute(f"SELECT * FROM {self.table_name} LIMIT 1000").fetchdf()
+            # Основная информация
+            total_rows = self.conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
             
-            columns_info = []
+            # Получаем sample для анализа
+            df_sample = self.conn.execute(f"SELECT * FROM {table_name} LIMIT 10000").fetchdf()
+            
+            info = {
+                'total_rows': total_rows,
+                'total_columns': len(df_sample.columns),
+                'dimensions': [],
+                'metrics': [],
+                'dates': [],
+                'memory_mb': df_sample.memory_usage(deep=True).sum() / 1024 / 1024
+            }
+            
             for col in df_sample.columns:
-                # Определяем числовые колонки
-                is_numeric = pd.api.types.is_numeric_dtype(df_sample[col])
-                
-                columns_info.append({
+                col_info = {
                     'name': col,
-                    'is_numeric': is_numeric,
                     'dtype': str(df_sample[col].dtype),
-                    'unique_count': df_sample[col].nunique()
-                })
+                    'unique_count': df_sample[col].nunique(),
+                    'null_count': df_sample[col].isnull().sum(),
+                    'null_percentage': (df_sample[col].isnull().sum() / len(df_sample)) * 100
+                }
+                
+                if pd.api.types.is_numeric_dtype(df_sample[col]):
+                    col_info['category'] = 'metric'
+                    col_info['stats'] = {
+                        'min': float(df_sample[col].min()) if not df_sample[col].isnull().all() else None,
+                        'max': float(df_sample[col].max()) if not df_sample[col].isnull().all() else None,
+                        'mean': float(df_sample[col].mean()) if not df_sample[col].isnull().all() else None,
+                        'median': float(df_sample[col].median()) if not df_sample[col].isnull().all() else None,
+                        'std': float(df_sample[col].std()) if not df_sample[col].isnull().all() else None
+                    }
+                    info['metrics'].append(col_info)
+                elif pd.api.types.is_datetime64_any_dtype(df_sample[col]):
+                    col_info['category'] = 'date'
+                    col_info['range'] = {
+                        'min': df_sample[col].min(),
+                        'max': df_sample[col].max()
+                    }
+                    info['dates'].append(col_info)
+                else:
+                    col_info['category'] = 'dimension'
+                    # Топ значений
+                    top_values = df_sample[col].value_counts().head(10)
+                    col_info['top_values'] = top_values.to_dict()
+                    info['dimensions'].append(col_info)
             
-            return columns_info
+            return info
         except Exception as e:
-            st.error(f"Ошибка получения структуры: {str(e)}")
-            return []
+            st.error(f"Ошибка получения информации: {str(e)}")
+            return None
+
+# ============================================
+# 3. РАСШИРЕННАЯ АНАЛИТИКА
+# ============================================
+class AdvancedAnalytics:
+    def __init__(self, conn, table_name='main_data'):
+        self.conn = conn
+        self.table_name = table_name
     
-    def create_pivot(self, rows, columns, values, agg_func='SUM'):
-        """Создаёт сводную таблицу как в Excel"""
+    def time_series_analysis(self, date_column, metric_column, freq='M'):
+        """Временной ряд анализ с трендами и сезонностью"""
+        query = f"""
+            SELECT 
+                DATE_TRUNC('{freq}', {date_column}) as period,
+                SUM({metric_column}) as total,
+                AVG({metric_column}) as avg,
+                COUNT(*) as count
+            FROM {self.table_name}
+            GROUP BY period
+            ORDER BY period
+        """
+        
+        df = self.conn.execute(query).fetchdf()
+        
+        if len(df) > 1:
+            # Добавляем скользящее среднее
+            df['moving_avg_3'] = df['total'].rolling(window=3, min_periods=1).mean()
+            df['moving_avg_7'] = df['total'].rolling(window=7, min_periods=1).mean()
+            
+            # Рост/падение
+            df['growth'] = df['total'].pct_change() * 100
+            
+            # Тренд (линейная регрессия)
+            if len(df) > 2:
+                x = np.arange(len(df))
+                z = np.polyfit(x, df['total'].fillna(0), 1)
+                df['trend'] = np.polyval(z, x)
+        
+        return df
+    
+    def correlation_analysis(self, metrics):
+        """Корреляционный анализ между метриками"""
+        if len(metrics) < 2:
+            return None
+        
+        # Получаем данные
+        query = f"SELECT {', '.join(metrics)} FROM {self.table_name}"
+        df = self.conn.execute(query).fetchdf()
+        
+        # Корреляционная матрица
+        corr_matrix = df.corr()
+        
+        # P-значения
+        p_values = pd.DataFrame(index=corr_matrix.columns, columns=corr_matrix.columns)
+        for i in range(len(metrics)):
+            for j in range(len(metrics)):
+                if i != j:
+                    _, p_values.iloc[i, j] = stats.pearsonr(df[metrics[i]], df[metrics[j]])
+                else:
+                    p_values.iloc[i, j] = 0
+        
+        return {
+            'correlation': corr_matrix,
+            'p_values': p_values,
+            'significant': corr_matrix[corr_matrix.abs() > 0.5].stack()
+        }
+    
+    def predictive_forecast(self, date_column, metric_column, periods=12):
+        """Простой прогноз на основе линейной регрессии"""
+        # Получаем исторические данные
+        query = f"""
+            SELECT 
+                DATE_TRUNC('month', {date_column}) as period,
+                SUM({metric_column}) as value
+            FROM {self.table_name}
+            GROUP BY period
+            ORDER BY period
+        """
+        
+        df = self.conn.execute(query).fetchdf()
+        
+        if len(df) < 3:
+            return None
+        
+        # Создаем прогноз
+        x = np.arange(len(df))
+        y = df['value'].values
+        
+        # Линейная регрессия
+        z = np.polyfit(x, y, 1)
+        p = np.poly1d(z)
+        
+        # Прогноз на будущие периоды
+        future_x = np.arange(len(df), len(df) + periods)
+        forecast = p(future_x)
+        
+        # Доверительные интервалы (упрощенно)
+        residuals = y - p(x)
+        std_residuals = np.std(residuals)
+        upper_bound = forecast + 1.96 * std_residuals
+        lower_bound = forecast - 1.96 * std_residuals
+        
+        return {
+            'historical': df,
+            'forecast': forecast,
+            'upper_bound': upper_bound,
+            'lower_bound': lower_bound,
+            'periods': future_x
+        }
+    
+    def anomaly_detection(self, metric_column, threshold=3):
+        """Обнаружение аномалий с использованием Z-score"""
+        query = f"SELECT {metric_column} FROM {self.table_name}"
+        values = self.conn.execute(query).fetchdf()[metric_column].values
+        
+        # Z-score
+        z_scores = np.abs(stats.zscore(values))
+        anomalies = np.where(z_scores > threshold)[0]
+        
+        # IQR метод
+        q1 = np.percentile(values, 25)
+        q3 = np.percentile(values, 75)
+        iqr = q3 - q1
+        iqr_anomalies = np.where((values < (q1 - 1.5 * iqr)) | (values > (q3 + 1.5 * iqr)))[0]
+        
+        return {
+            'z_score_anomalies': anomalies,
+            'iqr_anomalies': iqr_anomalies,
+            'z_scores': z_scores,
+            'threshold': threshold
+        }
+    
+    def cohort_analysis(self, dimension, metric, cohort_period='month'):
+        """Когортный анализ"""
+        query = f"""
+            WITH cohorts AS (
+                SELECT 
+                    {dimension} as cohort,
+                    DATE_TRUNC('{cohort_period}', MIN(date)) as cohort_date
+                FROM {self.table_name}
+                GROUP BY {dimension}
+            )
+            SELECT 
+                c.cohort,
+                c.cohort_date,
+                SUM(t.{metric}) as total_value
+            FROM {self.table_name} t
+            JOIN cohorts c ON t.{dimension} = c.cohort
+            GROUP BY c.cohort, c.cohort_date
+            ORDER BY c.cohort_date
+        """
+        
+        return self.conn.execute(query).fetchdf()
+    
+    def segmentation(self, segment_column, metrics):
+        """Сегментационный анализ"""
+        segment_stats = []
+        
+        for metric in metrics:
+            query = f"""
+                SELECT 
+                    {segment_column},
+                    COUNT(*) as count,
+                    AVG({metric}) as avg_{metric},
+                    SUM({metric}) as total_{metric},
+                    MIN({metric}) as min_{metric},
+                    MAX({metric}) as max_{metric},
+                    STDDEV({metric}) as std_{metric}
+                FROM {self.table_name}
+                GROUP BY {segment_column}
+                ORDER BY total_{metric} DESC
+            """
+            stats = self.conn.execute(query).fetchdf()
+            segment_stats.append(stats)
+        
+        return segment_stats
+
+# ============================================
+# 4. УМНАЯ СВОДНАЯ ТАБЛИЦА
+# ============================================
+class SmartPivotTable:
+    def __init__(self, conn, table_name='main_data'):
+        self.conn = conn
+        self.table_name = table_name
+    
+    def create_pivot(self, rows, columns, values, agg_func='SUM', 
+                     show_totals=True, show_percentages=False, 
+                     rank_values=False):
+        """Создает расширенную сводную таблицу"""
         
         if not values:
-            return None, "Выберите значения для анализа"
+            # Автоматически выбираем первую метрику
+            info = self.conn.execute(f"SELECT * FROM {self.table_name} LIMIT 1").fetchdf()
+            metrics = [col for col in info.columns if pd.api.types.is_numeric_dtype(info[col])]
+            if metrics:
+                values = [metrics[0]]
+            else:
+                return None, "Нет числовых полей для анализа"
         
         try:
-            # Строим запрос с группировкой
             group_by = rows + columns
             
             if group_by:
-                # Агрегируем данные
                 agg_exprs = [f"{agg_func}({v}) as {v}" for v in values]
                 query = f"""
                     SELECT 
@@ -121,9 +560,8 @@ class PivotTableBuilder:
                 
                 result = self.conn.execute(query).fetchdf()
                 
-                # Создаём Pivot Table (транспонирование)
-                if columns and len(columns) > 0 and len(result) > 0:
-                    # Для одной метрики
+                # Создаем pivot
+                if columns and len(columns) > 0:
                     if len(values) == 1:
                         pivot_df = result.pivot_table(
                             index=rows if rows else None,
@@ -133,7 +571,6 @@ class PivotTableBuilder:
                             fill_value=0
                         )
                     else:
-                        # Для нескольких метрик
                         pivot_dfs = []
                         for value in values:
                             temp_pivot = result.pivot_table(
@@ -143,17 +580,30 @@ class PivotTableBuilder:
                                 aggfunc=agg_func.lower(),
                                 fill_value=0
                             )
-                            # Добавляем префикс с названием метрики
                             temp_pivot.columns = [f"{value} - {col}" for col in temp_pivot.columns]
                             pivot_dfs.append(temp_pivot)
-                        
                         pivot_df = pd.concat(pivot_dfs, axis=1)
+                    
+                    # Проценты от общего
+                    if show_percentages and len(pivot_df) > 0:
+                        pivot_df = (pivot_df / pivot_df.sum().sum()) * 100
+                    
+                    # Ранжирование
+                    if rank_values and len(pivot_df) > 0:
+                        for col in pivot_df.columns:
+                            pivot_df[f"{col}_rank"] = pivot_df[col].rank(ascending=False)
+                    
+                    # Итоги
+                    if show_totals:
+                        pivot_df['Итого по строкам'] = pivot_df.sum(axis=1)
+                        grand_total = pivot_df.sum(axis=0)
+                        grand_total.name = 'ВСЕГО'
+                        pivot_df = pd.concat([pivot_df, grand_total.to_frame().T])
                     
                     return pivot_df, f"✅ Сводная таблица: {len(pivot_df)} строк × {len(pivot_df.columns)} столбцов"
                 else:
-                    return result, f"✅ Данные сгруппированы: {len(result)} строк"
+                    return result, f"✅ Группировка: {len(result)} строк"
             else:
-                # Простая агрегация без группировки
                 agg_exprs = [f"{agg_func}({v}) as {v}" for v in values]
                 query = f"SELECT {', '.join(agg_exprs)} FROM {self.table_name}"
                 result = self.conn.execute(query).fetchdf()
@@ -161,345 +611,487 @@ class PivotTableBuilder:
                 
         except Exception as e:
             return None, f"❌ Ошибка: {str(e)}"
+    
+    def create_dashboard(self, rows, columns, values, agg_func='SUM'):
+        """Создает аналитическую панель с множеством показателей"""
+        
+        pivot_df, message = self.create_pivot(rows, columns, values, agg_func, 
+                                              show_totals=True, show_percentages=True)
+        
+        if pivot_df is None:
+            return None, message
+        
+        # Дополнительные метрики
+        dashboard = {
+            'data': pivot_df,
+            'summary': {
+                'total_rows': len(pivot_df),
+                'total_columns': len(pivot_df.columns),
+                'total_sum': pivot_df.select_dtypes(include=['number']).sum().sum(),
+                'average': pivot_df.select_dtypes(include=['number']).mean().mean(),
+                'max_value': pivot_df.select_dtypes(include=['number']).max().max(),
+                'min_value': pivot_df.select_dtypes(include=['number']).min().min()
+            }
+        }
+        
+        return dashboard, message
 
 # ============================================
-# 4. ОСНОВНОЙ ИНТЕРФЕЙС
+# 5. УПРАВЛЕНИЕ ОТЧЕТАМИ
+# ============================================
+class ReportManager:
+    def __init__(self, conn):
+        self.conn = conn
+    
+    def save_report(self, name, config, data):
+        """Сохраняет отчет"""
+        data_hash = hashlib.md5(data.to_json().encode()).hexdigest()
+        
+        self.conn.execute("""
+            INSERT INTO saved_reports (report_name, report_date, config, data_hash, is_favorite)
+            VALUES (?, CURRENT_TIMESTAMP, ?, ?, ?)
+        """, [name, json.dumps(config), data_hash, False])
+        
+        return True
+    
+    def load_reports(self, favorite_only=False):
+        """Загружает сохраненные отчеты"""
+        query = "SELECT * FROM saved_reports"
+        if favorite_only:
+            query += " WHERE is_favorite = TRUE"
+        query += " ORDER BY report_date DESC"
+        
+        return self.conn.execute(query).fetchdf()
+    
+    def delete_report(self, report_id):
+        """Удаляет отчет"""
+        self.conn.execute("DELETE FROM saved_reports WHERE id = ?", [report_id])
+    
+    def toggle_favorite(self, report_id, is_favorite):
+        """Переключает статус избранного"""
+        self.conn.execute("UPDATE saved_reports SET is_favorite = ? WHERE id = ?", 
+                         [is_favorite, report_id])
+
+# ============================================
+# 6. ОСНОВНОЙ ИНТЕРФЕЙС
 # ============================================
 def main():
-    st.set_page_config(
-        page_title="Excel-style Pivot Table",
-        page_icon="📊",
-        layout="wide"
-    )
+    # Инициализация менеджеров
+    data_manager = DataManager()
+    analytics = AdvancedAnalytics(data_manager.conn)
+    pivot_tool = SmartPivotTable(data_manager.conn)
+    report_manager = ReportManager(data_manager.conn)
     
-    st.title("📊 Конструктор сводных таблиц (как в Excel)")
-    st.markdown("---")
-    
-    # Подключаемся к БД
-    conn = get_duckdb_connection()
-    pivot_builder = PivotTableBuilder(conn)
+    # Заголовок
+    st.title("🚀 Ultimate Pivot Analytics Platform")
+    st.markdown("*Профессиональная аналитика как в Tableau, но проще и быстрее*")
     
     # ============================================
-    # SIDEBAR - ЗАГРУЗКА ДАННЫХ
+    # САЙДБАР
     # ============================================
     with st.sidebar:
-        st.header("📁 Загрузка данных")
+        st.image("https://img.icons8.com/color/96/000000/pivot-table.png", width=80)
+        st.markdown("## 📊 Управление")
         
-        uploaded_files = st.file_uploader(
-            "Загрузите Excel файлы",
-            type=['xlsx', 'xls'],
-            accept_multiple_files=True
+        # Вкладки в сайдбаре
+        sidebar_tab = st.radio(
+            "Меню",
+            ["📁 Данные", "💾 Отчеты", "⚙️ Настройки"],
+            index=0
         )
         
-        if uploaded_files:
-            if st.button("🚀 Загрузить в БД", type="primary", use_container_width=True):
-                temp_files = []
-                for f in uploaded_files:
-                    temp_path = f"temp_{f.name}"
-                    with open(temp_path, "wb") as out:
-                        out.write(f.getbuffer())
-                    temp_files.append(temp_path)
-                
-                with st.spinner("Загрузка данных..."):
-                    rows, msg = load_excel_to_duckdb(conn, temp_files)
-                    st.success(msg)
-                
-                for f in temp_files:
-                    try:
-                        os.remove(f)
-                    except:
-                        pass
-                st.rerun()
-        
-        st.divider()
-        
-        # Информация о данных
-        try:
-            row_count = conn.execute("SELECT COUNT(*) FROM fact_sales").fetchone()[0]
-            st.metric("📊 Всего записей", f"{row_count:,}")
+        if sidebar_tab == "📁 Данные":
+            st.markdown("### Загрузка файлов")
             
-            # Показываем список таблиц
-            tables = conn.execute("SHOW TABLES").fetchdf()
-            if not tables.empty:
-                with st.expander("📋 Таблицы в БД"):
-                    st.dataframe(tables, use_container_width=True)
-        except:
-            st.info("ℹ️ Нет данных")
-            row_count = 0
+            uploaded_files = st.file_uploader(
+                "Выберите Excel файлы",
+                type=['xlsx', 'xls', 'csv'],
+                accept_multiple_files=True,
+                key="file_uploader"
+            )
+            
+            if uploaded_files:
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button("🚀 Новая загрузка", use_container_width=True):
+                        with st.spinner("Загрузка..."):
+                            rows, msg = data_manager.load_excel_files(uploaded_files)
+                            st.success(msg)
+                            st.rerun()
+                
+                with col2:
+                    if st.button("➕ Добавить файлы", use_container_width=True):
+                        with st.spinner("Добавление..."):
+                            rows, msg = data_manager.add_new_files(uploaded_files)
+                            st.success(msg)
+                            st.rerun()
+            
+            st.divider()
+            
+            # Информация о данных
+            data_info = data_manager.get_data_info()
+            if data_info:
+                st.markdown("### 📈 Статистика данных")
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("Строк", f"{data_info['total_rows']:,}")
+                    st.metric("Колонок", data_info['total_columns'])
+                with col2:
+                    st.metric("Измерений", len(data_info['dimensions']))
+                    st.metric("Метрик", len(data_info['metrics']))
+                
+                with st.expander("📋 Детали колонок"):
+                    for col in data_info['dimensions'][:5]:
+                        st.markdown(f"**{col['name']}** (📐) - {col['unique_count']} уникальных")
+                    for col in data_info['metrics'][:5]:
+                        st.markdown(f"**{col['name']}** (💹) - {col.get('stats', {}).get('mean', 'N/A'):.2f}")
         
-        st.divider()
+        elif sidebar_tab == "💾 Отчеты":
+            st.markdown("### Сохраненные отчеты")
+            
+            reports = report_manager.load_reports()
+            if not reports.empty:
+                for _, report in reports.iterrows():
+                    with st.container():
+                        col1, col2 = st.columns([3, 1])
+                        with col1:
+                            st.markdown(f"**{report['report_name']}**")
+                            st.caption(report['report_date'].strftime("%Y-%m-%d %H:%M"))
+                        with col2:
+                            if st.button("⭐" if report['is_favorite'] else "☆", key=f"fav_{report['id']}"):
+                                report_manager.toggle_favorite(report['id'], not report['is_favorite'])
+                                st.rerun()
+            else:
+                st.info("Нет сохраненных отчетов")
         
-        if st.button("🗑️ Очистить все данные", use_container_width=True):
-            try:
-                conn.execute("DROP TABLE IF EXISTS fact_sales")
-                conn.execute("DROP TABLE IF EXISTS load_history")
-                st.success("Данные очищены")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Ошибка: {str(e)}")
+        else:  # Настройки
+            st.markdown("### ⚙️ Настройки")
+            
+            theme = st.selectbox("Тема", ["Светлая", "Темная", "Системная"])
+            language = st.selectbox("Язык", ["Русский", "English"])
+            chart_theme = st.selectbox("Стиль графиков", ["Plotly", "Seaborn", "ggplot"])
+            
+            st.divider()
+            
+            if st.button("🗑️ Очистить все данные", use_container_width=True):
+                try:
+                    data_manager.conn.execute("DROP TABLE IF EXISTS main_data")
+                    st.success("Данные очищены")
+                    st.rerun()
+                except:
+                    pass
     
     # ============================================
-    # ОСНОВНОЙ ЭКРАН - КОНСТРУКТОР СВОДНОЙ ТАБЛИЦЫ
+    # ОСНОВНАЯ ОБЛАСТЬ
     # ============================================
     
-    if row_count > 0:
-        # Получаем колонки
-        columns_info = pivot_builder.get_columns_info()
+    data_info = data_manager.get_data_info()
+    
+    if data_info and data_info['total_rows'] > 0:
+        # Главные вкладки
+        main_tab1, main_tab2, main_tab3, main_tab4, main_tab5 = st.tabs([
+            "📊 Сводная таблица", 
+            "📈 Расширенная аналитика", 
+            "🎨 Визуализации",
+            "🔮 Прогнозы",
+            "💾 Сохранить"
+        ])
         
-        if columns_info:
-            # Разделяем на измерения и факты
-            dimensions = [col['name'] for col in columns_info if not col['is_numeric']]
-            measures = [col['name'] for col in columns_info if col['is_numeric']]
+        with main_tab1:
+            st.markdown('<div class="section-header">📊 Конструктор сводной таблицы</div>', unsafe_allow_html=True)
             
-            st.subheader("🎯 Настройка сводной таблицы")
-            st.markdown("*Выберите поля в каждой области*")
-            
-            # Три колонки как в Excel
+            # Три колонки для настроек
             col1, col2, col3 = st.columns(3)
             
             with col1:
-                st.markdown("### 📊 СТРОКИ")
-                rows = st.multiselect(
-                    "Поля для строк (иерархия)",
-                    options=dimensions,
-                    key="rows_select",
-                    placeholder="Выберите поля для строк..."
-                )
-                
-                # Показываем выбранные поля
-                if rows:
-                    st.markdown("**Выбранные поля:**")
-                    for i, r in enumerate(rows, 1):
-                        st.markdown(f"{i}. 📍 **{r}**")
+                st.markdown("### 📊 Строки")
+                dimension_names = [d['name'] for d in data_info['dimensions']] + [d['name'] for d in data_info['dates']]
+                rows = st.multiselect("Поля для строк", dimension_names, key="rows")
             
             with col2:
-                st.markdown("### 📈 КОЛОНКИ")
-                columns = st.multiselect(
-                    "Поля для колонок",
-                    options=dimensions,
-                    key="columns_select",
-                    placeholder="Выберите поля для колонок..."
-                )
-                
-                if columns:
-                    st.markdown("**Выбранные поля:**")
-                    for i, c in enumerate(columns, 1):
-                        st.markdown(f"{i}. 📌 **{c}**")
+                st.markdown("### 📈 Колонки")
+                columns = st.multiselect("Поля для колонок", dimension_names, key="columns")
             
             with col3:
-                st.markdown("### 🧮 ЗНАЧЕНИЯ")
-                values = st.multiselect(
-                    "Числовые поля для анализа",
-                    options=measures,
-                    key="values_select",
-                    placeholder="Выберите числовые поля..."
-                )
+                st.markdown("### 🧮 Значения")
+                metric_names = [m['name'] for m in data_info['metrics']]
+                values = st.multiselect("Числовые поля", metric_names, key="values")
                 
                 if values:
-                    agg_func = st.selectbox(
-                        "📐 Функция агрегации",
-                        ["SUM", "COUNT", "AVG", "MIN", "MAX"],
-                        key="agg_func"
+                    agg_func = st.selectbox("Агрегация", ["SUM", "COUNT", "AVG", "MIN", "MAX", "STD"])
+            
+            # Дополнительные опции
+            with st.expander("⚙️ Расширенные настройки"):
+                col_opt1, col_opt2, col_opt3 = st.columns(3)
+                with col_opt1:
+                    show_totals = st.checkbox("Показывать итоги", True)
+                with col_opt2:
+                    show_percentages = st.checkbox("Показывать проценты", False)
+                with col_opt3:
+                    rank_values = st.checkbox("Ранжировать значения", False)
+            
+            # Кнопка построения
+            if st.button("🔄 Построить сводную таблицу", type="primary", use_container_width=True):
+                with st.spinner("Построение..."):
+                    result, msg = pivot_tool.create_pivot(
+                        rows, columns, values, agg_func if values else 'SUM',
+                        show_totals, show_percentages, rank_values
                     )
                     
-                    st.markdown("**Выбранные поля:**")
-                    for i, v in enumerate(values, 1):
-                        st.markdown(f"{i}. 💹 **{v}** ({agg_func})")
-            
-            st.markdown("---")
-            
-            # Кнопка обновления
-            col1, col2, col3 = st.columns([1, 2, 1])
-            with col2:
-                update_button = st.button(
-                    "🔄 ПОСТРОИТЬ СВОДНУЮ ТАБЛИЦУ",
-                    type="primary",
-                    use_container_width=True
-                )
-            
-            # Отображаем результат
-            if update_button or (rows or columns or values):
-                if values:
-                    with st.spinner("Построение сводной таблицы..."):
-                        result_df, message = pivot_builder.create_pivot(rows, columns, values, agg_func)
+                    if result is not None:
+                        st.success(msg)
                         
-                        if result_df is not None:
-                            st.success(message)
-                            
-                            # Показываем результат
-                            st.subheader("📋 РЕЗУЛЬТАТ СВОДНОЙ ТАБЛИЦЫ")
-                            
-                            # Настройки отображения
-                            with st.expander("⚙️ Настройки отображения"):
-                                col_settings1, col_settings2 = st.columns(2)
-                                with col_settings1:
-                                    show_totals = st.checkbox("Показывать итоги", value=True)
-                                    number_format = st.checkbox("Форматировать числа", value=True)
-                                with col_settings2:
-                                    precision = st.slider("Точность чисел", 0, 4, 2)
-                            
-                            # Форматируем
-                            if number_format:
-                                styled_df = result_df.style.format(f"{{:,.{precision}f}}")
-                            else:
-                                styled_df = result_df
-                            
-                            # Показываем таблицу
-                            st.dataframe(styled_df, use_container_width=True, height=500)
-                            
-                            # Итоги
-                            if show_totals and len(result_df) > 0:
-                                st.markdown("### 📊 ИТОГИ")
-                                
-                                tab1, tab2 = st.tabs(["Итоги по строкам", "Итоги по колонкам"])
-                                
-                                with tab1:
-                                    if rows:
-                                        row_totals = result_df.sum(axis=1).sort_values(ascending=False)
-                                        st.dataframe(
-                                            pd.DataFrame({
-                                                'Категория': row_totals.index,
-                                                'Сумма': row_totals.values
-                                            }).head(20),
-                                            use_container_width=True
-                                        )
-                                    else:
-                                        st.info("Нет полей в строках")
-                                
-                                with tab2:
-                                    if columns:
-                                        col_totals = result_df.sum(axis=0).sort_values(ascending=False)
-                                        st.dataframe(
-                                            pd.DataFrame({
-                                                'Категория': col_totals.index,
-                                                'Сумма': col_totals.values
-                                            }).head(20),
-                                            use_container_width=True
-                                        )
-                                    else:
-                                        st.info("Нет полей в колонках")
-                            
-                            # Визуализация
-                            st.subheader("📊 ВИЗУАЛИЗАЦИЯ")
-                            
-                            # Выбираем метрику для визуализации
-                            if len(result_df.columns) > 0:
-                                # Определяем числовые колонки
-                                numeric_cols = result_df.select_dtypes(include=['number']).columns
-                                
-                                if len(numeric_cols) > 0:
-                                    chart_col1, chart_col2 = st.columns(2)
-                                    
-                                    with chart_col1:
-                                        chart_type = st.selectbox(
-                                            "Тип графика",
-                                            ["Столбчатая диаграмма", "Линейный график", "Тепловая карта", "Круговая диаграмма"]
-                                        )
-                                    
-                                    with chart_col2:
-                                        metric_for_chart = st.selectbox(
-                                            "Метрика для отображения",
-                                            numeric_cols
-                                        )
-                                    
-                                    # Строим график
-                                    if chart_type == "Столбчатая диаграмма":
-                                        plot_data = result_df[metric_for_chart].head(20)
-                                        fig = px.bar(
-                                            x=plot_data.index,
-                                            y=plot_data.values,
-                                            title=f"{metric_for_chart} - Столбчатая диаграмма",
-                                            labels={'x': 'Категория', 'y': metric_for_chart},
-                                            color_discrete_sequence=['#FF4B4B']
-                                        )
-                                        st.plotly_chart(fig, use_container_width=True)
-                                    
-                                    elif chart_type == "Линейный график":
-                                        plot_data = result_df[metric_for_chart]
-                                        fig = px.line(
-                                            x=plot_data.index,
-                                            y=plot_data.values,
-                                            title=f"{metric_for_chart} - Тренд",
-                                            markers=True
-                                        )
-                                        st.plotly_chart(fig, use_container_width=True)
-                                    
-                                    elif chart_type == "Тепловая карта":
-                                        if len(result_df) > 1 and len(result_df.columns) > 1:
-                                            fig = px.imshow(
-                                                result_df[numeric_cols].values,
-                                                x=numeric_cols,
-                                                y=result_df.index,
-                                                title="Тепловая карта данных",
-                                                color_continuous_scale='RdBu',
-                                                aspect="auto"
-                                            )
-                                            st.plotly_chart(fig, use_container_width=True)
-                                        else:
-                                            st.warning("Для тепловой карты нужно больше данных")
-                                    
-                                    elif chart_type == "Круговая диаграмма":
-                                        plot_data = result_df[metric_for_chart].head(10)
-                                        fig = px.pie(
-                                            values=plot_data.values,
-                                            names=plot_data.index,
-                                            title=f"Распределение {metric_for_chart}"
-                                        )
-                                        st.plotly_chart(fig, use_container_width=True)
-                            
-                            # Экспорт
-                            st.subheader("💾 ЭКСПОРТ")
-                            
-                            csv_data = result_df.to_csv()
-                            st.download_button(
-                                label="📥 Скачать как CSV",
-                                data=csv_data,
-                                file_name=f"pivot_table_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                                mime="text/csv",
-                                use_container_width=True
-                            )
-                            
-                            # Дополнительная информация
-                            with st.expander("ℹ️ Информация о данных"):
-                                st.metric("Количество строк", len(result_df))
-                                st.metric("Количество столбцов", len(result_df.columns))
-                                st.write("**Структура данных:**")
-                                st.dataframe(result_df.dtypes.astype(str).reset_index().rename(columns={'index': 'Колонка', 0: 'Тип'}), use_container_width=True)
-                        else:
-                            st.error(message)
-                else:
-                    st.info("💡 **Выберите хотя бы одно поле в область ЗНАЧЕНИЯ** для построения сводной таблицы")
+                        # Показываем результат
+                        st.dataframe(result.style.background_gradient(cmap='Blues'), 
+                                    use_container_width=True, height=500)
+                        
+                        # Быстрая статистика
+                        st.markdown("### 📊 Краткая статистика")
+                        col_stat1, col_stat2, col_stat3, col_stat4 = st.columns(4)
+                        with col_stat1:
+                            st.metric("Строк", len(result))
+                        with col_stat2:
+                            st.metric("Колонок", len(result.columns))
+                        with col_stat3:
+                            total = result.select_dtypes(include=['number']).sum().sum()
+                            st.metric("Общая сумма", f"{total:,.0f}")
+                        with col_stat4:
+                            avg = result.select_dtypes(include=['number']).mean().mean()
+                            st.metric("Среднее", f"{avg:,.2f}")
+        
+        with main_tab2:
+            st.markdown('<div class="section-header">📈 Расширенный аналитический модуль</div>', unsafe_allow_html=True)
+            
+            analytics_type = st.selectbox(
+                "Тип анализа",
+                ["Корреляционный анализ", "Когортный анализ", "Сегментация", "Обнаружение аномалий", "Временные ряды"]
+            )
+            
+            if analytics_type == "Корреляционный анализ":
+                selected_metrics = st.multiselect("Выберите метрики", metric_names, default=metric_names[:3])
+                if len(selected_metrics) >= 2:
+                    corr_result = analytics.correlation_analysis(selected_metrics)
+                    if corr_result:
+                        st.subheader("Корреляционная матрица")
+                        fig = px.imshow(
+                            corr_result['correlation'],
+                            text_auto=True,
+                            title="Корреляция между метриками",
+                            color_continuous_scale='RdBu',
+                            zmin=-1, zmax=1
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                        
+                        st.subheader("Значимые корреляции")
+                        significant = corr_result['significant']
+                        if not significant.empty:
+                            for idx, val in significant.items():
+                                st.info(f"**{idx[0]}** ↔ **{idx[1]}**: {val:.3f}")
+            
+            elif analytics_type == "Обнаружение аномалий":
+                metric_for_anomaly = st.selectbox("Выберите метрику", metric_names)
+                threshold = st.slider("Порог чувствительности", 1, 5, 3)
+                
+                if st.button("Найти аномалии"):
+                    anomalies = analytics.anomaly_detection(metric_for_anomaly, threshold)
+                    
+                    st.success(f"Найдено аномалий: {len(anomalies['z_score_anomalies'])} (Z-score) и {len(anomalies['iqr_anomalies'])} (IQR)")
+                    
+                    # Визуализация
+                    fig = go.Figure()
+                    values = analytics.conn.execute(f"SELECT {metric_for_anomaly} FROM main_data").fetchdf()[metric_for_anomaly]
+                    fig.add_trace(go.Scatter(y=values, mode='lines+markers', name='Значения'))
+                    fig.add_trace(go.Scatter(y=anomalies['z_scores'], mode='lines', name='Z-score', yaxis='y2'))
+                    fig.update_layout(
+                        title=f"Обнаружение аномалий в {metric_for_anomaly}",
+                        yaxis=dict(title=metric_for_anomaly),
+                        yaxis2=dict(title="Z-score", overlaying='y', side='right')
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+        
+        with main_tab3:
+            st.markdown('<div class="section-header">🎨 Интерактивные визуализации</div>', unsafe_allow_html=True)
+            
+            viz_type = st.selectbox(
+                "Тип визуализации",
+                ["Столбчатая диаграмма", "Линейный график", "Круговая диаграмма", 
+                 "Ящик с усами", "Тепловая карта", "3D Поверхность", "Солнечные лучи", "Водопад"]
+            )
+            
+            if data_info['dimensions']:
+                x_axis = st.selectbox("Ось X", [d['name'] for d in data_info['dimensions']])
+            else:
+                x_axis = None
+            
+            y_axis = st.selectbox("Ось Y", metric_names)
+            
+            if viz_type == "Столбчатая диаграмма":
+                query = f"SELECT {x_axis}, SUM({y_axis}) as total FROM main_data GROUP BY {x_axis} ORDER BY total DESC LIMIT 20"
+                plot_data = data_manager.conn.execute(query).fetchdf()
+                
+                fig = px.bar(plot_data, x=x_axis, y='total', 
+                            title=f"{y_axis} по {x_axis}",
+                            color_discrete_sequence=px.colors.qualitative.Set3,
+                            text='total')
+                fig.update_traces(texttemplate='%{text:.2s}', textposition='outside')
+                st.plotly_chart(fig, use_container_width=True)
+            
+            elif viz_type == "Тепловая карта":
+                # Создаем матрицу корреляции
+                corr_data = analytics.correlation_analysis(metric_names[:5])
+                if corr_data:
+                    fig = px.imshow(corr_data['correlation'], text_auto=True, 
+                                  color_continuous_scale='Viridis',
+                                  title="Тепловая карта корреляций")
+                    st.plotly_chart(fig, use_container_width=True)
+            
+            elif viz_type == "Солнечные лучи":
+                if len(data_info['dimensions']) >= 2:
+                    dim1, dim2 = st.selectbox("Первый уровень", [d['name'] for d in data_info['dimensions']]), \
+                                 st.selectbox("Второй уровень", [d['name'] for d in data_info['dimensions']])
+                    
+                    query = f"""
+                        SELECT {dim1}, {dim2}, SUM({y_axis}) as value
+                        FROM main_data
+                        GROUP BY {dim1}, {dim2}
+                    """
+                    sunburst_data = data_manager.conn.execute(query).fetchdf()
+                    
+                    fig = px.sunburst(sunburst_data, path=[dim1, dim2], values='value',
+                                    title=f"Иерархия {y_axis}")
+                    st.plotly_chart(fig, use_container_width=True)
+        
+        with main_tab4:
+            st.markdown('<div class="section-header">🔮 Прогнозирование и тренды</div>', unsafe_allow_html=True)
+            
+            if data_info['dates']:
+                date_col = st.selectbox("Дата", [d['name'] for d in data_info['dates']])
+                metric_for_forecast = st.selectbox("Метрика для прогноза", metric_names)
+                periods = st.slider("Периодов прогноза", 3, 24, 12)
+                
+                if st.button("Построить прогноз"):
+                    forecast = analytics.predictive_forecast(date_col, metric_for_forecast, periods)
+                    
+                    if forecast:
+                        # Исторические данные
+                        fig = go.Figure()
+                        fig.add_trace(go.Scatter(
+                            x=forecast['historical']['period'],
+                            y=forecast['historical']['value'],
+                            mode='lines+markers',
+                            name='Исторические данные',
+                            line=dict(color='blue', width=2)
+                        ))
+                        
+                        # Прогноз
+                        future_dates = [forecast['historical']['period'].iloc[-1] + timedelta(days=30*i) 
+                                      for i in range(1, periods+1)]
+                        fig.add_trace(go.Scatter(
+                            x=future_dates,
+                            y=forecast['forecast'],
+                            mode='lines+markers',
+                            name='Прогноз',
+                            line=dict(color='red', width=2, dash='dash')
+                        ))
+                        
+                        # Доверительный интервал
+                        fig.add_trace(go.Scatter(
+                            x=future_dates + future_dates[::-1],
+                            y=list(forecast['upper_bound']) + list(forecast['lower_bound'][::-1]),
+                            fill='toself',
+                            fillcolor='rgba(255,0,0,0.2)',
+                            line=dict(color='rgba(255,255,255,0)'),
+                            name='Доверительный интервал 95%'
+                        ))
+                        
+                        fig.update_layout(
+                            title=f"Прогноз {metric_for_forecast} на {periods} периодов",
+                            xaxis_title="Период",
+                            yaxis_title=metric_for_forecast,
+                            hovermode='x unified'
+                        )
+                        
+                        st.plotly_chart(fig, use_container_width=True)
+                        
+                        # Показатели точности
+                        st.subheader("Метрики качества прогноза")
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric("Средняя ошибка", f"{np.mean(np.abs(forecast['historical']['value'].diff().dropna())):.2f}")
+                        with col2:
+                            st.metric("Тренд", f"{forecast['forecast'][-1] - forecast['historical']['value'].iloc[-1]:.2f}")
+                        with col3:
+                            st.metric("Волатильность", f"{forecast['historical']['value'].std():.2f}")
+        
+        with main_tab5:
+            st.markdown('<div class="section-header">💾 Сохранение и экспорт</div>', unsafe_allow_html=True)
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("### 💾 Сохранить отчет")
+                report_name = st.text_input("Название отчета")
+                if st.button("Сохранить текущий анализ"):
+                    # Сохраняем текущую конфигурацию
+                    config = {
+                        'rows': rows if 'rows' in locals() else [],
+                        'columns': columns if 'columns' in locals() else [],
+                        'values': values if 'values' in locals() else [],
+                        'timestamp': datetime.now().isoformat()
+                    }
+                    
+                    # Получаем текущие данные
+                    if 'result' in locals():
+                        report_manager.save_report(report_name, config, result)
+                        st.success("Отчет сохранен!")
+            
+            with col2:
+                st.markdown("### 📥 Экспорт данных")
+                export_format = st.selectbox("Формат", ["CSV", "Excel", "JSON", "HTML"])
+                
+                if 'result' in locals() and result is not None:
+                    if export_format == "CSV":
+                        csv = result.to_csv()
+                        st.download_button("Скачать CSV", csv, "report.csv", "text/csv")
+                    elif export_format == "Excel":
+                        output = pd.ExcelWriter('report.xlsx')
+                        result.to_excel(output, sheet_name='Pivot Report')
+                        output.close()
+                        with open('report.xlsx', 'rb') as f:
+                            st.download_button("Скачать Excel", f, "report.xlsx")
+                    elif export_format == "JSON":
+                        json_data = result.to_json(orient='records', indent=2)
+                        st.download_button("Скачать JSON", json_data, "report.json")
+                    elif export_format == "HTML":
+                        html = result.to_html()
+                        st.download_button("Скачать HTML", html, "report.html")
+    
     else:
-        # Показываем приветствие если нет данных
-        st.info("""
-        # 🎯 Добро пожаловать в конструктор сводных таблиц!
-        
-        ## Как это работает:
-        
-        1. **Загрузите Excel файлы** через боковую панель слева
-        2. **Выберите поля** в трёх областях:
-           - 📊 **СТРОКИ** - категории для группировки по вертикали
-           - 📈 **КОЛОНКИ** - категории для транспонирования
-           - 🧮 **ЗНАЧЕНИЯ** - числовые поля для анализа
-        3. **Нажмите кнопку** "Построить сводную таблицу"
-        4. **Анализируйте результат** и меняйте настройки
-        
-        💡 *Полностью как в Excel, но с мощью DuckDB под капотом!*
-        """)
-        
-        # Пример
-        with st.expander("📖 Пример структуры Excel файла"):
-            st.markdown("""
-            Ваш Excel файл должен содержать данные в табличном формате, например:
-            
-            | Дата       | Продукт | Категория | Продажи | Количество |
-            |------------|---------|-----------|---------|-------------|
-            | 2024-01-01 | Ноутбук | Электроника| 50000   | 10          |
-            | 2024-01-02 | Мышь    | Аксессуары | 1500    | 30          |
-            
-            - **СТРОКИ/КОЛОНКИ**: текстовые поля (Дата, Продукт, Категория)
-            - **ЗНАЧЕНИЯ**: числовые поля (Продажи, Количество)
-            """)
+        # Пустое состояние
+        st.markdown("""
+        <div style="text-align: center; padding: 50px;">
+            <h1>🎯 Добро пожаловать в Ultimate Pivot Analytics!</h1>
+            <p style="font-size: 1.2em;">Профессиональная аналитическая платформа нового поколения</p>
+            <br>
+            <div style="display: flex; justify-content: center; gap: 20px; flex-wrap: wrap;">
+                <div style="background: white; padding: 20px; border-radius: 10px; width: 250px;">
+                    <h3>📁 1. Загрузите данные</h3>
+                    <p>Excel, CSV файлы с автоматическим определением структуры</p>
+                </div>
+                <div style="background: white; padding: 20px; border-radius: 10px; width: 250px;">
+                    <h3>🎯 2. Настройте анализ</h3>
+                    <p>Строки, колонки, значения - как в Excel, но мощнее</p>
+                </div>
+                <div style="background: white; padding: 20px; border-radius: 10px; width: 250px;">
+                    <h3>📊 3. Анализируйте</h3>
+                    <p>Сводные таблицы, прогнозы, корреляции, аномалии</p>
+                </div>
+            </div>
+            <br>
+            <p style="color: #667eea;">🚀 Готовы начать? Загрузите файлы через боковую панель!</p>
+        </div>
+        """, unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
