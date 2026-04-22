@@ -1,0 +1,5 @@
+streamlit
+pandas
+openpyxl
+pyarrow
+rich>=10.14.0
