@@ -49,44 +49,58 @@ conn = get_connection()
 # Принудительно создаём админа
 def force_create_admin():
     try:
-        # Создаём таблицу пользователей
+        # Упрощённое создание таблицы пользователей
         conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY,
-                username VARCHAR UNIQUE,
-                password_hash VARCHAR,
-                role VARCHAR,
-                created_at TIMESTAMP,
-                last_login TIMESTAMP
+                id INTEGER,
+                username VARCHAR UNIQUE NOT NULL,
+                password_hash VARCHAR NOT NULL,
+                role VARCHAR NOT NULL DEFAULT 'VIEWER',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_login TIMESTAMP,
+                PRIMARY KEY (id)
             )
         """)
         
         # Создаём таблицу прав
         conn.execute("""
             CREATE TABLE IF NOT EXISTS permissions (
-                id INTEGER PRIMARY KEY,
-                user_role VARCHAR,
-                cube_name VARCHAR,
-                access_level VARCHAR,
+                id INTEGER,
+                user_role VARCHAR NOT NULL,
+                cube_name VARCHAR NOT NULL,
+                access_level VARCHAR NOT NULL DEFAULT 'READ',
+                PRIMARY KEY (id),
                 UNIQUE(user_role, cube_name)
             )
         """)
         
-        # Удаляем старого админа если есть
-        conn.execute("DELETE FROM users WHERE username = 'admin'")
+        # Проверяем существование админа
+        admin_exists = conn.execute("SELECT COUNT(*) FROM users WHERE username = 'admin'").fetchone()[0]
         
-        # Создаём нового админа
-        admin_hash = hashlib.sha256("admin123".encode()).hexdigest()
-        conn.execute("""
-            INSERT INTO users (username, password_hash, role, created_at)
-            VALUES ('admin', ?, 'ADMIN', CURRENT_TIMESTAMP)
-        """, [admin_hash])
+        if admin_exists == 0:
+            # Получаем следующий ID
+            max_id_result = conn.execute("SELECT COALESCE(MAX(id), 0) FROM users").fetchone()
+            next_id = max_id_result[0] + 1
+            
+            # Создаём админа
+            admin_hash = hashlib.sha256("admin123".encode()).hexdigest()
+            conn.execute("""
+                INSERT INTO users (id, username, password_hash, role, created_at)
+                VALUES (?, 'admin', ?, 'ADMIN', CURRENT_TIMESTAMP)
+            """, [next_id, admin_hash])
+        else:
+            # Обновляем пароль админа
+            admin_hash = hashlib.sha256("admin123".encode()).hexdigest()
+            conn.execute("UPDATE users SET password_hash = ?, role = 'ADMIN' WHERE username = 'admin'", [admin_hash])
         
         # Даём админу все права
+        max_perm_id = conn.execute("SELECT COALESCE(MAX(id), 0) FROM permissions").fetchone()
+        next_perm_id = max_perm_id[0] + 1
+        
         conn.execute("""
-            INSERT OR REPLACE INTO permissions (user_role, cube_name, access_level)
-            VALUES ('ADMIN', '*', 'ADMIN')
-        """)
+            INSERT OR REPLACE INTO permissions (id, user_role, cube_name, access_level)
+            VALUES (?, 'ADMIN', '*', 'ADMIN')
+        """, [next_perm_id])
         
         return True
     except Exception as e:
@@ -281,7 +295,7 @@ class QueryCache:
             'hits': self.cache_stats['hits'],
             'misses': self.cache_stats['misses'],
             'hit_rate': f"{hit_rate:.1%}",
-            'memory_usage': len(pickle.dumps(self.cache)) / 1024 / 1024  # MB
+            'memory_usage': len(pickle.dumps(self.cache)) / 1024 / 1024
         }
 
 # ============================================
@@ -393,7 +407,6 @@ class OLAPManager:
         """Создание куба с оптимизациями"""
         table_name = f"cube_{name.lower().replace(' ', '_')}"
         
-        # Создаем партиции если указано
         if partition_by and partition_by in df.columns:
             for value in df[partition_by].unique():
                 partition_df = df[df[partition_by] == value]
@@ -401,16 +414,15 @@ class OLAPManager:
                 self.conn.register('temp_partition', partition_df)
                 self.conn.execute(f"CREATE TABLE IF NOT EXISTS {partition_name} AS SELECT * FROM temp_partition")
                 
+                max_id = self.conn.execute("SELECT COALESCE(MAX(id), 0) FROM table_partitions").fetchone()[0]
                 self.conn.execute("""
-                    INSERT INTO table_partitions (table_name, partition_column, partition_value, row_count, created_at)
-                    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-                """, [table_name, partition_by, str(value), len(partition_df)])
+                    INSERT INTO table_partitions (id, table_name, partition_column, partition_value, row_count, created_at)
+                    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """, [max_id + 1, table_name, partition_by, str(value), len(partition_df)])
         else:
-            # Обычное создание таблицы
             self.conn.register('temp_df', df)
             self.conn.execute(f"CREATE OR REPLACE TABLE {table_name} AS SELECT * FROM temp_df")
         
-        # Создаем индексы для ускорения
         for col in df.columns:
             if df[col].nunique() < 1000:
                 try:
@@ -451,10 +463,12 @@ class OLAPManager:
         
         current_user = st.session_state.get('username', 'admin')
         
+        max_id = self.conn.execute("SELECT COALESCE(MAX(id), 0) FROM olap_cubes").fetchone()[0]
+        
         self.conn.execute("""
-            INSERT OR REPLACE INTO olap_cubes (name, table_name, definition, updated_at, owner)
-            VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?)
-        """, [cube.name, cube.table_name, json.dumps(definition), current_user])
+            INSERT OR REPLACE INTO olap_cubes (id, name, table_name, definition, updated_at, owner)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+        """, [max_id + 1, cube.name, cube.table_name, json.dumps(definition), current_user])
     
     def slice_dice(self, cube_name: str, rows: List[str], cols: List[str], 
                    measures: List[str], filters: Dict = None) -> pd.DataFrame:
@@ -467,7 +481,6 @@ class OLAPManager:
         if df.empty:
             return df
         
-        # Создаем сводную таблицу
         if rows and cols:
             pivot_df = df.pivot_table(
                 index=rows,
@@ -495,7 +508,6 @@ class OLAPManager:
         
         start_time = datetime.now()
         
-        # Проверяем кэш
         cache_key = f"{cube_name}_{dimensions}_{measures}_{filters}_{top_n}_{order_by}"
         if use_cache:
             cached_result = self.query_cache.get(cache_key)
@@ -508,7 +520,6 @@ class OLAPManager:
         
         table_name = cube.table_name
         
-        # Формируем запрос
         select_parts = []
         group_by_parts = []
         
@@ -532,7 +543,6 @@ class OLAPManager:
         
         query = f"SELECT {', '.join(select_parts)} FROM {table_name}"
         
-        # WHERE
         if filters:
             where_conditions = []
             for col, value in filters.items():
@@ -549,31 +559,25 @@ class OLAPManager:
             if where_conditions:
                 query += f" WHERE {' AND '.join(where_conditions)}"
         
-        # GROUP BY
         if group_by_parts:
             query += f" GROUP BY {', '.join(group_by_parts)}"
         
-        # ORDER BY
         if order_by:
             order_parts = [f'"{col}" {direction}' for col, direction in order_by]
             query += f" ORDER BY {', '.join(order_parts)}"
         
-        # LIMIT
         if top_n:
             query += f" LIMIT {top_n}"
         
-        # Выполняем запрос
         try:
             result = self.conn.execute(query).fetchdf()
         except Exception as e:
             st.error(f"Ошибка выполнения запроса: {e}")
             result = pd.DataFrame()
         
-        # Сохраняем в историю
         execution_time = (datetime.now() - start_time).total_seconds()
         self._log_query(cube_name, query, execution_time, len(result))
         
-        # Кэшируем результат
         if use_cache and not result.empty:
             self.query_cache.set(cache_key, result)
         
@@ -583,10 +587,11 @@ class OLAPManager:
         """Логирование запросов для оптимизации"""
         current_user = st.session_state.get('username', 'anonymous')
         try:
+            max_id = self.conn.execute("SELECT COALESCE(MAX(id), 0) FROM query_history").fetchone()[0]
             self.conn.execute("""
-                INSERT INTO query_history (cube_name, query_text, execution_time, rows_returned, timestamp, user_name)
-                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
-            """, [cube_name, query[:1000], execution_time, rows, current_user])
+                INSERT INTO query_history (id, cube_name, query_text, execution_time, rows_returned, timestamp, user_name)
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+            """, [max_id + 1, cube_name, query[:1000], execution_time, rows, current_user])
         except:
             pass
     
@@ -656,10 +661,11 @@ class UserManager:
         
         password_hash = hashlib.sha256(password.encode()).hexdigest()
         try:
+            max_id = self.conn.execute("SELECT COALESCE(MAX(id), 0) FROM users").fetchone()[0]
             self.conn.execute("""
-                INSERT INTO users (username, password_hash, role, created_at)
-                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-            """, [username, password_hash, role])
+                INSERT INTO users (id, username, password_hash, role, created_at)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """, [max_id + 1, username, password_hash, role])
             return True
         except:
             return False
@@ -671,11 +677,9 @@ class UserManager:
         
         role = st.session_state.get('role', 'VIEWER')
         
-        # ADMIN имеет полный доступ
         if role == 'ADMIN':
             return True
         
-        # Проверяем права
         try:
             result = self.conn.execute("""
                 SELECT access_level FROM permissions 
@@ -944,7 +948,6 @@ class OLAPInterface:
         </div>
         """, unsafe_allow_html=True)
         
-        # Боковая панель
         with st.sidebar:
             st.markdown("## 🎯 Навигация")
             
@@ -962,7 +965,6 @@ class OLAPInterface:
             
             st.markdown("---")
             
-            # Статистика кэша
             if st.checkbox("📊 Статистика кэша"):
                 stats = self.olap_manager.query_cache.get_stats()
                 st.metric("Размер кэша", f"{stats['size']} запросов")
@@ -976,7 +978,6 @@ class OLAPInterface:
             
             st.markdown("---")
             
-            # Выбор куба
             try:
                 cubes_df = self.conn.execute(
                     "SELECT name, updated_at FROM olap_cubes ORDER BY updated_at DESC"
@@ -1022,7 +1023,6 @@ class OLAPInterface:
             except:
                 st.info("Нет доступных кубов. Создайте новый в Конструкторе.")
         
-        # Основная область
         if mode == "📊 Анализ":
             self.render_analysis_mode()
         elif mode == "📈 Дашборды":
@@ -1210,10 +1210,11 @@ class OLAPInterface:
                     df = self.conn.execute(query).fetchdf()
                     st.dataframe(df, use_container_width=True)
                     
-                    selected_value = st.selectbox(f"Выберите {next_level}", df[next_level].tolist())
-                    if st.button("Продолжить drill-down"):
-                        st.session_state.drill_path.append(selected_value)
-                        st.rerun()
+                    if not df.empty:
+                        selected_value = st.selectbox(f"Выберите {next_level}", df[next_level].tolist())
+                        if st.button("Продолжить drill-down"):
+                            st.session_state.drill_path.append(selected_value)
+                            st.rerun()
             
             if st.session_state.drill_path:
                 if st.button("⬆️ Drill up"):
@@ -1391,10 +1392,11 @@ class OLAPInterface:
                 }
                 
                 try:
+                    max_id = self.conn.execute("SELECT COALESCE(MAX(id), 0) FROM olap_slices").fetchone()[0]
                     self.conn.execute("""
-                        INSERT INTO olap_slices (cube_name, slice_name, definition, created_at, owner)
-                        VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?)
-                    """, [cube.name, slice_name, json.dumps(slice_def), st.session_state.get('username')])
+                        INSERT INTO olap_slices (id, cube_name, slice_name, definition, created_at, owner)
+                        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+                    """, [max_id + 1, cube.name, slice_name, json.dumps(slice_def), st.session_state.get('username')])
                     st.success("✅ Срез сохранен!")
                 except Exception as e:
                     st.error(f"Ошибка сохранения: {e}")
@@ -1456,6 +1458,7 @@ class OLAPInterface:
                 if st.button("Создать"):
                     if self.user_manager.create_user(new_username, new_password, new_role):
                         st.success("✅ Пользователь создан")
+                        st.rerun()
                     else:
                         st.error("❌ Ошибка создания")
             
@@ -1475,10 +1478,11 @@ class OLAPInterface:
                     access = st.selectbox("Уровень доступа", ["READ", "WRITE", "ADMIN"])
                     
                     if st.button("Назначить права"):
+                        max_id = self.conn.execute("SELECT COALESCE(MAX(id), 0) FROM permissions").fetchone()[0]
                         self.conn.execute("""
-                            INSERT OR REPLACE INTO permissions (user_role, cube_name, access_level)
-                            VALUES (?, ?, ?)
-                        """, [role, cube, access])
+                            INSERT OR REPLACE INTO permissions (id, user_role, cube_name, access_level)
+                            VALUES (?, ?, ?, ?)
+                        """, [max_id + 1, role, cube, access])
                         st.success("✅ Права назначены")
             except:
                 st.info("Нет созданных кубов")
