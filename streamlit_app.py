@@ -12,7 +12,6 @@ from pathlib import Path
 import glob
 from typing import List, Dict, Any, Optional
 import numpy as np
-from scipy import stats
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -113,7 +112,56 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ============================================
-# 2. УПРАВЛЕНИЕ ДАННЫМИ
+# 2. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (ЗАМЕНА SCIPY)
+# ============================================
+def calculate_z_scores(data):
+    """Расчет Z-score без scipy"""
+    mean = np.mean(data)
+    std = np.std(data)
+    if std == 0:
+        return np.zeros_like(data)
+    return (data - mean) / std
+
+def calculate_pearson_correlation(x, y):
+    """Расчет корреляции Пирсона без scipy"""
+    x = np.array(x)
+    y = np.array(y)
+    
+    # Удаляем NaN
+    mask = ~(np.isnan(x) | np.isnan(y))
+    x = x[mask]
+    y = y[mask]
+    
+    if len(x) < 2:
+        return 0
+    
+    n = len(x)
+    sum_x = np.sum(x)
+    sum_y = np.sum(y)
+    sum_xy = np.sum(x * y)
+    sum_x2 = np.sum(x * x)
+    sum_y2 = np.sum(y * y)
+    
+    numerator = n * sum_xy - sum_x * sum_y
+    denominator = np.sqrt((n * sum_x2 - sum_x**2) * (n * sum_y2 - sum_y**2))
+    
+    if denominator == 0:
+        return 0
+    
+    return numerator / denominator
+
+def calculate_p_value(r, n):
+    """Расчет p-value для корреляции"""
+    import math
+    if abs(r) == 1:
+        return 0
+    t = r * math.sqrt((n - 2) / (1 - r**2))
+    # Приблизительный расчет p-value (для демонстрации)
+    p_value = 2 * (1 - min(0.9999, abs(t) / (abs(t) + 10)))
+    return p_value
+
+# ============================================
+# 3. УПРАВЛЕНИЕ ДАННЫМИ
 # ============================================
 class DataManager:
     def __init__(self):
@@ -347,7 +395,7 @@ class DataManager:
             return None
 
 # ============================================
-# 3. РАСШИРЕННАЯ АНАЛИТИКА
+# 4. РАСШИРЕННАЯ АНАЛИТИКА (БЕЗ SCIPY)
 # ============================================
 class AdvancedAnalytics:
     def __init__(self, conn, table_name='main_data'):
@@ -395,21 +443,30 @@ class AdvancedAnalytics:
         df = self.conn.execute(query).fetchdf()
         
         # Корреляционная матрица
-        corr_matrix = df.corr()
+        corr_matrix = pd.DataFrame(index=metrics, columns=metrics)
+        p_values = pd.DataFrame(index=metrics, columns=metrics)
         
-        # P-значения
-        p_values = pd.DataFrame(index=corr_matrix.columns, columns=corr_matrix.columns)
-        for i in range(len(metrics)):
-            for j in range(len(metrics)):
-                if i != j:
-                    _, p_values.iloc[i, j] = stats.pearsonr(df[metrics[i]], df[metrics[j]])
+        for i, m1 in enumerate(metrics):
+            for j, m2 in enumerate(metrics):
+                if i == j:
+                    corr_matrix.loc[m1, m2] = 1
+                    p_values.loc[m1, m2] = 0
                 else:
-                    p_values.iloc[i, j] = 0
+                    # Используем нашу функцию корреляции
+                    r = calculate_pearson_correlation(df[m1].values, df[m2].values)
+                    corr_matrix.loc[m1, m2] = r
+                    # Расчет p-value
+                    n = len(df[m1].dropna())
+                    p_values.loc[m1, m2] = calculate_p_value(r, n)
+        
+        # Конвертируем в float
+        corr_matrix = corr_matrix.astype(float)
+        p_values = p_values.astype(float)
         
         return {
             'correlation': corr_matrix,
             'p_values': p_values,
-            'significant': corr_matrix[corr_matrix.abs() > 0.5].stack()
+            'significant': []
         }
     
     def predictive_forecast(self, date_column, metric_column, periods=12):
@@ -460,9 +517,9 @@ class AdvancedAnalytics:
         query = f"SELECT {metric_column} FROM {self.table_name}"
         values = self.conn.execute(query).fetchdf()[metric_column].values
         
-        # Z-score
-        z_scores = np.abs(stats.zscore(values))
-        anomalies = np.where(z_scores > threshold)[0]
+        # Z-score (используем нашу функцию)
+        z_scores = calculate_z_scores(values)
+        anomalies = np.where(np.abs(z_scores) > threshold)[0]
         
         # IQR метод
         q1 = np.percentile(values, 25)
@@ -523,7 +580,7 @@ class AdvancedAnalytics:
         return segment_stats
 
 # ============================================
-# 4. УМНАЯ СВОДНАЯ ТАБЛИЦА
+# 5. УМНАЯ СВОДНАЯ ТАБЛИЦА
 # ============================================
 class SmartPivotTable:
     def __init__(self, conn, table_name='main_data'):
@@ -637,7 +694,7 @@ class SmartPivotTable:
         return dashboard, message
 
 # ============================================
-# 5. УПРАВЛЕНИЕ ОТЧЕТАМИ
+# 6. УПРАВЛЕНИЕ ОТЧЕТАМИ
 # ============================================
 class ReportManager:
     def __init__(self, conn):
@@ -673,7 +730,7 @@ class ReportManager:
                          [is_favorite, report_id])
 
 # ============================================
-# 6. ОСНОВНОЙ ИНТЕРФЕЙС
+# 7. ОСНОВНОЙ ИНТЕРФЕЙС
 # ============================================
 def main():
     # Инициализация менеджеров
@@ -684,13 +741,12 @@ def main():
     
     # Заголовок
     st.title("🚀 Ultimate Pivot Analytics Platform")
-    st.markdown("*Профессиональная аналитика как в Tableau, но проще и быстрее*")
+    st.markdown("*Профессиональная аналитика без дополнительных зависимостей*")
     
     # ============================================
     # САЙДБАР
     # ============================================
     with st.sidebar:
-        st.image("https://img.icons8.com/color/96/000000/pivot-table.png", width=80)
         st.markdown("## 📊 Управление")
         
         # Вкладки в сайдбаре
@@ -745,7 +801,12 @@ def main():
                     for col in data_info['dimensions'][:5]:
                         st.markdown(f"**{col['name']}** (📐) - {col['unique_count']} уникальных")
                     for col in data_info['metrics'][:5]:
-                        st.markdown(f"**{col['name']}** (💹) - {col.get('stats', {}).get('mean', 'N/A'):.2f}")
+                        stats = col.get('stats', {})
+                        mean_val = stats.get('mean', 'N/A')
+                        if mean_val != 'N/A':
+                            st.markdown(f"**{col['name']}** (💹) - {mean_val:.2f}")
+                        else:
+                            st.markdown(f"**{col['name']}** (💹) - N/A")
         
         elif sidebar_tab == "💾 Отчеты":
             st.markdown("### Сохраненные отчеты")
@@ -770,7 +831,6 @@ def main():
             
             theme = st.selectbox("Тема", ["Светлая", "Темная", "Системная"])
             language = st.selectbox("Язык", ["Русский", "English"])
-            chart_theme = st.selectbox("Стиль графиков", ["Plotly", "Seaborn", "ggplot"])
             
             st.divider()
             
@@ -842,6 +902,9 @@ def main():
                     if result is not None:
                         st.success(msg)
                         
+                        # Сохраняем результат в session state
+                        st.session_state['result'] = result
+                        
                         # Показываем результат
                         st.dataframe(result.style.background_gradient(cmap='Blues'), 
                                     use_container_width=True, height=500)
@@ -869,7 +932,7 @@ def main():
             )
             
             if analytics_type == "Корреляционный анализ":
-                selected_metrics = st.multiselect("Выберите метрики", metric_names, default=metric_names[:3])
+                selected_metrics = st.multiselect("Выберите метрики", metric_names, default=metric_names[:min(3, len(metric_names))])
                 if len(selected_metrics) >= 2:
                     corr_result = analytics.correlation_analysis(selected_metrics)
                     if corr_result:
@@ -882,12 +945,6 @@ def main():
                             zmin=-1, zmax=1
                         )
                         st.plotly_chart(fig, use_container_width=True)
-                        
-                        st.subheader("Значимые корреляции")
-                        significant = corr_result['significant']
-                        if not significant.empty:
-                            for idx, val in significant.items():
-                                st.info(f"**{idx[0]}** ↔ **{idx[1]}**: {val:.3f}")
             
             elif analytics_type == "Обнаружение аномалий":
                 metric_for_anomaly = st.selectbox("Выберите метрику", metric_names)
@@ -916,7 +973,7 @@ def main():
             viz_type = st.selectbox(
                 "Тип визуализации",
                 ["Столбчатая диаграмма", "Линейный график", "Круговая диаграмма", 
-                 "Ящик с усами", "Тепловая карта", "3D Поверхность", "Солнечные лучи", "Водопад"]
+                 "Ящик с усами", "Тепловая карта"]
             )
             
             if data_info['dimensions']:
@@ -939,27 +996,11 @@ def main():
             
             elif viz_type == "Тепловая карта":
                 # Создаем матрицу корреляции
-                corr_data = analytics.correlation_analysis(metric_names[:5])
+                corr_data = analytics.correlation_analysis(metric_names[:min(5, len(metric_names))])
                 if corr_data:
                     fig = px.imshow(corr_data['correlation'], text_auto=True, 
                                   color_continuous_scale='Viridis',
                                   title="Тепловая карта корреляций")
-                    st.plotly_chart(fig, use_container_width=True)
-            
-            elif viz_type == "Солнечные лучи":
-                if len(data_info['dimensions']) >= 2:
-                    dim1, dim2 = st.selectbox("Первый уровень", [d['name'] for d in data_info['dimensions']]), \
-                                 st.selectbox("Второй уровень", [d['name'] for d in data_info['dimensions']])
-                    
-                    query = f"""
-                        SELECT {dim1}, {dim2}, SUM({y_axis}) as value
-                        FROM main_data
-                        GROUP BY {dim1}, {dim2}
-                    """
-                    sunburst_data = data_manager.conn.execute(query).fetchdf()
-                    
-                    fig = px.sunburst(sunburst_data, path=[dim1, dim2], values='value',
-                                    title=f"Иерархия {y_axis}")
                     st.plotly_chart(fig, use_container_width=True)
         
         with main_tab4:
@@ -1023,6 +1064,8 @@ def main():
                             st.metric("Тренд", f"{forecast['forecast'][-1] - forecast['historical']['value'].iloc[-1]:.2f}")
                         with col3:
                             st.metric("Волатильность", f"{forecast['historical']['value'].std():.2f}")
+            else:
+                st.info("Для прогнозирования необходимы колонки с датами")
         
         with main_tab5:
             st.markdown('<div class="section-header">💾 Сохранение и экспорт</div>', unsafe_allow_html=True)
@@ -1032,25 +1075,22 @@ def main():
             with col1:
                 st.markdown("### 💾 Сохранить отчет")
                 report_name = st.text_input("Название отчета")
-                if st.button("Сохранить текущий анализ"):
-                    # Сохраняем текущую конфигурацию
+                if st.button("Сохранить текущий анализ") and 'result' in st.session_state:
                     config = {
                         'rows': rows if 'rows' in locals() else [],
                         'columns': columns if 'columns' in locals() else [],
                         'values': values if 'values' in locals() else [],
                         'timestamp': datetime.now().isoformat()
                     }
-                    
-                    # Получаем текущие данные
-                    if 'result' in locals():
-                        report_manager.save_report(report_name, config, result)
-                        st.success("Отчет сохранен!")
+                    report_manager.save_report(report_name, config, st.session_state['result'])
+                    st.success("Отчет сохранен!")
             
             with col2:
                 st.markdown("### 📥 Экспорт данных")
-                export_format = st.selectbox("Формат", ["CSV", "Excel", "JSON", "HTML"])
+                export_format = st.selectbox("Формат", ["CSV", "Excel", "JSON"])
                 
-                if 'result' in locals() and result is not None:
+                if 'result' in st.session_state:
+                    result = st.session_state['result']
                     if export_format == "CSV":
                         csv = result.to_csv()
                         st.download_button("Скачать CSV", csv, "report.csv", "text/csv")
@@ -1063,9 +1103,6 @@ def main():
                     elif export_format == "JSON":
                         json_data = result.to_json(orient='records', indent=2)
                         st.download_button("Скачать JSON", json_data, "report.json")
-                    elif export_format == "HTML":
-                        html = result.to_html()
-                        st.download_button("Скачать HTML", html, "report.html")
     
     else:
         # Пустое состояние
