@@ -25,15 +25,15 @@ st.set_page_config(
 )
 
 # ============================================
-# 2. ИНИЦИАЛИЗАЦИЯ БД И АДМИНА
+# 2. ГАРАНТИРОВАННОЕ СОЗДАНИЕ АДМИНА
 # ============================================
-if 'db_initialized' not in st.session_state:
+if 'db_ready' not in st.session_state:
     if os.path.exists('olap_analytics.db'):
         try:
             os.remove('olap_analytics.db')
         except:
             pass
-    st.session_state.db_initialized = True
+    st.session_state.db_ready = True
 
 @st.cache_resource
 def get_connection():
@@ -45,7 +45,7 @@ def get_connection():
 conn = get_connection()
 
 def init_database():
-    """Полная инициализация базы данных"""
+    """Полная инициализация базы данных с гарантированным созданием админа"""
     try:
         # Таблица пользователей
         conn.execute("""
@@ -66,6 +66,34 @@ def init_database():
         except:
             pass
         
+        # ПРИНУДИТЕЛЬНОЕ СОЗДАНИЕ АДМИНА
+        # Удаляем старого админа
+        conn.execute("DELETE FROM users WHERE username = 'admin'")
+        
+        # Получаем следующий ID
+        max_id = conn.execute("SELECT COALESCE(MAX(id), 0) FROM users").fetchone()[0]
+        
+        # Хеш пароля "admin123"
+        admin_hash = hashlib.sha256("admin123".encode()).hexdigest()
+        
+        # Создаём админа
+        conn.execute("""
+            INSERT INTO users (id, username, password_hash, role, email, is_active)
+            VALUES (?, 'admin', ?, 'ADMIN', 'admin@olap.local', TRUE)
+        """, [max_id + 1, admin_hash])
+        
+        # ПРОВЕРЯЕМ СОЗДАНИЕ
+        check = conn.execute("SELECT username, password_hash, role FROM users WHERE username = 'admin'").fetchone()
+        if check:
+            # Проверяем пароль
+            test_hash = hashlib.sha256("admin123".encode()).hexdigest()
+            if check[1] == test_hash:
+                st.sidebar.success("✅ Админ создан: admin / admin123")
+            else:
+                # Исправляем пароль если не совпадает
+                conn.execute("UPDATE users SET password_hash = ? WHERE username = 'admin'", [test_hash])
+                st.sidebar.success("✅ Пароль админа обновлён: admin / admin123")
+        
         # Таблица прав доступа
         conn.execute("""
             CREATE TABLE IF NOT EXISTS permissions (
@@ -82,6 +110,14 @@ def init_database():
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_permissions_role_cube ON permissions(user_role, cube_name)")
         except:
             pass
+        
+        # Даём админу все права
+        conn.execute("DELETE FROM permissions WHERE user_role = 'ADMIN' AND cube_name = '*'")
+        max_perm = conn.execute("SELECT COALESCE(MAX(id), 0) FROM permissions").fetchone()[0]
+        conn.execute("""
+            INSERT INTO permissions (id, user_role, cube_name, access_level, granted_by)
+            VALUES (?, 'ADMIN', '*', 'ADMIN', 'system')
+        """, [max_perm + 1])
         
         # Таблица кубов
         conn.execute("""
@@ -156,7 +192,7 @@ def init_database():
             )
         """)
         
-        # Таблица scheduled reports
+        # Таблица отчётов
         conn.execute("""
             CREATE TABLE IF NOT EXISTS scheduled_reports (
                 id INTEGER PRIMARY KEY,
@@ -172,32 +208,6 @@ def init_database():
                 is_active BOOLEAN DEFAULT TRUE
             )
         """)
-        
-        # Создаём админа
-        admin_exists = conn.execute("SELECT COUNT(*) FROM users WHERE username = 'admin'").fetchone()[0]
-        
-        if admin_exists == 0:
-            max_id = conn.execute("SELECT COALESCE(MAX(id), 0) FROM users").fetchone()[0]
-            admin_hash = hashlib.sha256("admin123".encode()).hexdigest()
-            conn.execute("""
-                INSERT INTO users (id, username, password_hash, role, email, is_active)
-                VALUES (?, 'admin', ?, 'ADMIN', 'admin@olap.local', TRUE)
-            """, [max_id + 1, admin_hash])
-        else:
-            admin_hash = hashlib.sha256("admin123".encode()).hexdigest()
-            conn.execute("UPDATE users SET password_hash = ?, role = 'ADMIN' WHERE username = 'admin'", [admin_hash])
-        
-        # Права админа
-        perm_exists = conn.execute(
-            "SELECT COUNT(*) FROM permissions WHERE user_role = 'ADMIN' AND cube_name = '*'"
-        ).fetchone()[0]
-        
-        if perm_exists == 0:
-            max_perm_id = conn.execute("SELECT COALESCE(MAX(id), 0) FROM permissions").fetchone()[0]
-            conn.execute("""
-                INSERT INTO permissions (id, user_role, cube_name, access_level, granted_by)
-                VALUES (?, 'ADMIN', '*', 'ADMIN', 'system')
-            """, [max_perm_id + 1])
         
         return True
     except Exception as e:
@@ -344,22 +354,6 @@ st.markdown("""
         padding: 10px;
         border-radius: 5px;
         border-left: 4px solid #dc3545;
-    }
-    
-    .alert-warning {
-        background: #fff3cd;
-        color: #856404;
-        padding: 10px;
-        border-radius: 5px;
-        border-left: 4px solid #ffc107;
-    }
-    
-    .alert-info {
-        background: #d1ecf1;
-        color: #0c5460;
-        padding: 10px;
-        border-radius: 5px;
-        border-left: 4px solid #17a2b8;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -789,8 +783,8 @@ class UserManager:
                 st.session_state.username = username
                 st.session_state.role = result[0]
                 return True
-        except:
-            pass
+        except Exception as e:
+            st.error(f"Ошибка аутентификации: {e}")
         return False
     
     def create_user(self, username: str, password: str, role: str = 'VIEWER', email: str = "") -> bool:
@@ -1211,7 +1205,6 @@ class OLAPInterface:
         self.dashboard_manager = DashboardManager(self.olap_manager)
         self.api = OLAPAPI(self.olap_manager)
         
-        # Инициализация session_state
         defaults = {
             'current_cube': None,
             'authenticated': False,
@@ -1219,9 +1212,7 @@ class OLAPInterface:
             'filters': {},
             'pivot_rows': [],
             'pivot_cols': [],
-            'pivot_measures': [],
-            'selected_dimensions': [],
-            'selected_measures': []
+            'pivot_measures': []
         }
         
         for key, default in defaults.items():
@@ -1257,7 +1248,7 @@ class OLAPInterface:
                     st.error("❌ Неверный логин или пароль")
         
         st.markdown("---")
-        st.markdown("<p style='text-align: center; color: #666;'>admin / admin123</p>", unsafe_allow_html=True)
+        st.markdown("<p style='text-align: center; color: #666;'>Демо-доступ: admin / admin123</p>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
     
     def render_main_interface(self):
@@ -1287,7 +1278,6 @@ class OLAPInterface:
             st.markdown("---")
             self.render_sidebar_stats()
         
-        # Рендеринг выбранного режима
         modes = {
             "📊 Анализ": self.render_analysis_mode,
             "📈 Дашборды": self.render_dashboard_mode,
@@ -1382,12 +1372,10 @@ class OLAPInterface:
         measures = st.multiselect("Меры", list(cube.measures.keys()), key="pivot_measures")
         
         with st.expander("⚙️ Настройки"):
-            c1, c2, c3 = st.columns(3)
+            c1, c2 = st.columns(2)
             with c1:
-                top_n = st.number_input("Топ N", 0, 10000, 0)
-            with c2:
                 export_format = st.selectbox("Экспорт", ["CSV", "Excel", "JSON"])
-            with c3:
+            with c2:
                 use_cache = st.checkbox("Кэш", True)
         
         if st.button("🎯 Построить", type="primary") and measures:
@@ -1397,7 +1385,6 @@ class OLAPInterface:
                 if not df.empty:
                     st.dataframe(df, use_container_width=True, height=500)
                     
-                    # Экспорт
                     if export_format == "CSV":
                         st.download_button("📥 CSV", df.to_csv(), "pivot.csv")
                     elif export_format == "Excel":
@@ -1528,12 +1515,15 @@ class OLAPInterface:
                             st.rerun()
             
             if st.session_state.drill_path:
-                if st.button("⬆️ Drill up"):
-                    st.session_state.drill_path.pop()
-                    st.rerun()
-                if st.button("🔄 Сбросить"):
-                    st.session_state.drill_path = []
-                    st.rerun()
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.button("⬆️ Drill up"):
+                        st.session_state.drill_path.pop()
+                        st.rerun()
+                with c2:
+                    if st.button("🔄 Сбросить"):
+                        st.session_state.drill_path = []
+                        st.rerun()
         else:
             st.info("Нет измерений с иерархиями")
     
@@ -1545,7 +1535,8 @@ class OLAPInterface:
             df = self.conn.execute(f"SELECT * FROM {cube.table_name} LIMIT 1000").fetchdf()
             st.dataframe(df, use_container_width=True, height=500)
             
-            st.metric("Всего строк", self.conn.execute(f"SELECT COUNT(*) FROM {cube.table_name}").fetchone()[0])
+            count = self.conn.execute(f"SELECT COUNT(*) FROM {cube.table_name}").fetchone()[0]
+            st.metric("Всего строк", count)
         except Exception as e:
             st.error(f"Ошибка: {e}")
     
@@ -1563,8 +1554,7 @@ class OLAPInterface:
         if not stats.empty:
             st.dataframe(stats, use_container_width=True)
         
-        st.markdown("#### 🗑️ Управление")
-        if st.button("Очистить кэш куба", type="secondary"):
+        if st.button("🗑️ Очистить кэш"):
             self.olap_manager.query_cache.clear()
             st.success("Кэш очищен")
     
@@ -1578,24 +1568,18 @@ class OLAPInterface:
         
         cube = st.session_state.current_cube
         
-        # Сохранение дашборда
         with st.expander("💾 Сохранить дашборд"):
             name = st.text_input("Название")
             if st.button("Сохранить") and name:
-                config = {
-                    'cube': cube.name,
-                    'created_by': st.session_state.username
-                }
+                config = {'cube': cube.name, 'created_by': st.session_state.username}
                 if self.dashboard_manager.save_dashboard(name, cube.name, config):
                     st.success("✅ Сохранено")
         
-        # Загрузка дашбордов
         dashboards = self.dashboard_manager.load_dashboards(cube.name)
         if not dashboards.empty:
             st.markdown("#### 📂 Сохранённые дашборды")
             st.dataframe(dashboards[['name', 'created_at', 'owner']], use_container_width=True)
         
-        # KPI
         st.markdown("#### 🎯 KPI")
         measures = list(cube.measures.keys())[:4]
         
@@ -1612,7 +1596,6 @@ class OLAPInterface:
                     </div>
                     """, unsafe_allow_html=True)
         
-        # Графики
         st.markdown("#### 📊 Графики")
         c1, c2 = st.columns(2)
         
@@ -1690,6 +1673,8 @@ class OLAPInterface:
                 if st.button("🗑️ Удалить", type="secondary"):
                     if self.olap_manager.delete_cube(to_delete):
                         st.success(f"✅ '{to_delete}' удалён")
+                        if st.session_state.current_cube and st.session_state.current_cube.name == to_delete:
+                            st.session_state.current_cube = None
                         st.rerun()
                     else:
                         st.error("Ошибка удаления")
@@ -1706,7 +1691,6 @@ class OLAPInterface:
         
         cube = st.session_state.current_cube
         
-        # Сохранение
         st.markdown("#### 💾 Сохранить срез")
         name = st.text_input("Название")
         desc = st.text_area("Описание")
@@ -1730,7 +1714,6 @@ class OLAPInterface:
             except Exception as e:
                 st.error(f"Ошибка: {e}")
         
-        # Загрузка
         st.markdown("#### 📂 Сохранённые срезы")
         slices = self.conn.execute("""
             SELECT id, slice_name, description, created_at, owner
@@ -1878,9 +1861,9 @@ class OLAPInterface:
                 self.conn.execute("VACUUM")
                 st.success("✅ Оптимизировано")
             
-            if st.button("📈 Размер БД"):
+            if os.path.exists('olap_analytics.db'):
                 size = os.path.getsize('olap_analytics.db') / 1024 / 1024
-                st.metric("Размер", f"{size:.2f} MB")
+                st.metric("Размер БД", f"{size:.2f} MB")
     
     def render_api_documentation(self):
         """API документация"""
