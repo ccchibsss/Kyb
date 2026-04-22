@@ -830,16 +830,31 @@ class OLAPAPI:
 # ============================================
 class OLAPInterface:
     def __init__(self):
-        self.conn = get_connection()
-        self.olap_manager = OLAPManager(self.conn)
-        self.user_manager = UserManager(self.conn)
-        self.dashboard_manager = DashboardManager(self.olap_manager)
-        self.api = OLAPAPI(self.olap_manager)
-        
-        if 'current_cube' not in st.session_state:
-            st.session_state.current_cube = None
-        if 'authenticated' not in st.session_state:
-            st.session_state.authenticated = False
+    self.conn = get_connection()
+    
+    # ВРЕМЕННО: Сброс БД при проблемах
+    if 'db_initialized' not in st.session_state:
+        try:
+            # Удаляем старые таблицы если они есть проблемы
+            self.conn.execute("DROP TABLE IF EXISTS users")
+            self.conn.execute("DROP TABLE IF EXISTS permissions")
+            self.conn.execute("DROP TABLE IF EXISTS olap_cubes")
+            self.conn.execute("DROP TABLE IF EXISTS olap_slices")
+            self.conn.execute("DROP TABLE IF EXISTS query_history")
+            self.conn.execute("DROP TABLE IF EXISTS table_partitions")
+            st.session_state.db_initialized = True
+        except:
+            pass
+    
+    self.olap_manager = OLAPManager(self.conn)
+    self.user_manager = UserManager(self.conn)
+    self.dashboard_manager = DashboardManager(self.olap_manager)
+    self.api = OLAPAPI(self.olap_manager)
+    
+    if 'current_cube' not in st.session_state:
+        st.session_state.current_cube = None
+    if 'authenticated' not in st.session_state:
+        st.session_state.authenticated = False
     
     def render_login_page(self):
         """Страница входа"""
