@@ -28,7 +28,6 @@ st.set_page_config(
 # 2. ПРИНУДИТЕЛЬНОЕ СОЗДАНИЕ АДМИНА (ИСПРАВЛЕНО)
 # ============================================
 if 'admin_created' not in st.session_state:
-    # Удаляем старую БД при первом запуске для чистоты
     if os.path.exists('olap_analytics.db'):
         try:
             os.remove('olap_analytics.db')
@@ -43,64 +42,68 @@ def get_connection():
     conn.execute("INSTALL httpfs; LOAD httpfs;")
     return conn
 
-# Создаём подключение
 conn = get_connection()
 
-# Принудительно создаём админа
 def force_create_admin():
     try:
-        # Упрощённое создание таблицы пользователей
+        # Создаём таблицу пользователей БЕЗ UNIQUE на id
         conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                id INTEGER,
-                username VARCHAR UNIQUE NOT NULL,
+                id INTEGER PRIMARY KEY,
+                username VARCHAR NOT NULL,
                 password_hash VARCHAR NOT NULL,
                 role VARCHAR NOT NULL DEFAULT 'VIEWER',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_login TIMESTAMP,
-                PRIMARY KEY (id)
+                last_login TIMESTAMP
             )
         """)
+        
+        # Создаём уникальный индекс отдельно
+        try:
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username)")
+        except:
+            pass
         
         # Создаём таблицу прав
         conn.execute("""
             CREATE TABLE IF NOT EXISTS permissions (
-                id INTEGER,
+                id INTEGER PRIMARY KEY,
                 user_role VARCHAR NOT NULL,
                 cube_name VARCHAR NOT NULL,
-                access_level VARCHAR NOT NULL DEFAULT 'READ',
-                PRIMARY KEY (id),
-                UNIQUE(user_role, cube_name)
+                access_level VARCHAR NOT NULL DEFAULT 'READ'
             )
         """)
+        
+        try:
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_permissions_role_cube ON permissions(user_role, cube_name)")
+        except:
+            pass
         
         # Проверяем существование админа
         admin_exists = conn.execute("SELECT COUNT(*) FROM users WHERE username = 'admin'").fetchone()[0]
         
         if admin_exists == 0:
-            # Получаем следующий ID
-            max_id_result = conn.execute("SELECT COALESCE(MAX(id), 0) FROM users").fetchone()
-            next_id = max_id_result[0] + 1
-            
-            # Создаём админа
+            max_id = conn.execute("SELECT COALESCE(MAX(id), 0) FROM users").fetchone()[0]
             admin_hash = hashlib.sha256("admin123".encode()).hexdigest()
             conn.execute("""
                 INSERT INTO users (id, username, password_hash, role, created_at)
                 VALUES (?, 'admin', ?, 'ADMIN', CURRENT_TIMESTAMP)
-            """, [next_id, admin_hash])
+            """, [max_id + 1, admin_hash])
         else:
-            # Обновляем пароль админа
             admin_hash = hashlib.sha256("admin123".encode()).hexdigest()
             conn.execute("UPDATE users SET password_hash = ?, role = 'ADMIN' WHERE username = 'admin'", [admin_hash])
         
-        # Даём админу все права
-        max_perm_id = conn.execute("SELECT COALESCE(MAX(id), 0) FROM permissions").fetchone()
-        next_perm_id = max_perm_id[0] + 1
+        # Даём админу все права (проверяем существование)
+        perm_exists = conn.execute(
+            "SELECT COUNT(*) FROM permissions WHERE user_role = 'ADMIN' AND cube_name = '*'"
+        ).fetchone()[0]
         
-        conn.execute("""
-            INSERT OR REPLACE INTO permissions (id, user_role, cube_name, access_level)
-            VALUES (?, 'ADMIN', '*', 'ADMIN')
-        """, [next_perm_id])
+        if perm_exists == 0:
+            max_perm_id = conn.execute("SELECT COALESCE(MAX(id), 0) FROM permissions").fetchone()[0]
+            conn.execute("""
+                INSERT INTO permissions (id, user_role, cube_name, access_level)
+                VALUES (?, 'ADMIN', '*', 'ADMIN')
+            """, [max_perm_id + 1])
         
         return True
     except Exception as e:
@@ -248,12 +251,10 @@ class QueryCache:
         self.cache_stats = {'hits': 0, 'misses': 0}
         
     def get_cache_key(self, query: str, params: tuple = ()) -> str:
-        """Генерация ключа кэша"""
         content = query + str(params)
         return hashlib.md5(content.encode()).hexdigest()
     
     def get(self, query: str, params: tuple = ()) -> Optional[pd.DataFrame]:
-        """Получение из кэша"""
         key = self.get_cache_key(query, params)
         if key in self.cache:
             self.cache_stats['hits'] += 1
@@ -262,7 +263,6 @@ class QueryCache:
         return None
     
     def set(self, query: str, data: pd.DataFrame, params: tuple = (), ttl: int = 3600):
-        """Сохранение в кэш"""
         key = self.get_cache_key(query, params)
         self.cache[key] = {
             'data': data.copy(),
@@ -272,7 +272,6 @@ class QueryCache:
         self._cleanup()
     
     def _cleanup(self):
-        """Очистка устаревших записей"""
         now = datetime.now()
         expired_keys = [
             key for key, value in self.cache.items()
@@ -282,12 +281,10 @@ class QueryCache:
             del self.cache[key]
     
     def clear(self):
-        """Полная очистка кэша"""
         self.cache.clear()
         self.cache_stats = {'hits': 0, 'misses': 0}
     
     def get_stats(self) -> Dict:
-        """Статистика кэша"""
         total = self.cache_stats['hits'] + self.cache_stats['misses']
         hit_rate = self.cache_stats['hits'] / total if total > 0 else 0
         return {
@@ -302,7 +299,6 @@ class QueryCache:
 # 4. МОДЕЛЬ ДАННЫХ OLAP
 # ============================================
 class OLAPDimension:
-    """Измерение OLAP с поддержкой иерархий"""
     def __init__(self, name: str, column: str, hierarchy: List[str] = None):
         self.name = name
         self.column = column
@@ -313,7 +309,6 @@ class OLAPDimension:
         self.attributes[name] = column
         
 class OLAPMeasure:
-    """Мера OLAP с поддержкой разных агрегаций"""
     def __init__(self, name: str, column: str, default_agg: str = 'SUM'):
         self.name = name
         self.column = column
@@ -321,7 +316,6 @@ class OLAPMeasure:
         self.allowed_aggs = ['SUM', 'AVG', 'MIN', 'MAX', 'COUNT', 'COUNT_DISTINCT', 'MEDIAN', 'STDDEV']
         
 class OLAPCube:
-    """OLAP Куб для многомерного анализа"""
     def __init__(self, name: str, table_name: str):
         self.name = name
         self.table_name = table_name
@@ -352,11 +346,10 @@ class OLAPManager:
         self._init_partitions()
         
     def _init_metadata_tables(self):
-        """Инициализация таблиц метаданных"""
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS olap_cubes (
                 id INTEGER PRIMARY KEY,
-                name VARCHAR UNIQUE,
+                name VARCHAR,
                 table_name VARCHAR,
                 definition JSON,
                 created_at TIMESTAMP,
@@ -364,6 +357,10 @@ class OLAPManager:
                 owner VARCHAR
             )
         """)
+        try:
+            self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_cubes_name ON olap_cubes(name)")
+        except:
+            pass
         
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS olap_slices (
@@ -389,7 +386,6 @@ class OLAPManager:
         """)
     
     def _init_partitions(self):
-        """Инициализация системы партиционирования"""
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS table_partitions (
                 id INTEGER PRIMARY KEY,
@@ -404,7 +400,6 @@ class OLAPManager:
     def create_cube_from_dataframe(self, name: str, df: pd.DataFrame, 
                                   auto_detect: bool = True,
                                   partition_by: str = None) -> OLAPCube:
-        """Создание куба с оптимизациями"""
         table_name = f"cube_{name.lower().replace(' ', '_')}"
         
         if partition_by and partition_by in df.columns:
@@ -452,7 +447,6 @@ class OLAPManager:
         return cube
     
     def _save_cube_metadata(self, cube: OLAPCube):
-        """Сохранение метаданных куба"""
         definition = {
             'dimensions': {name: {'column': d.column, 'hierarchy': d.hierarchy} 
                           for name, d in cube.dimensions.items()},
@@ -463,16 +457,24 @@ class OLAPManager:
         
         current_user = st.session_state.get('username', 'admin')
         
-        max_id = self.conn.execute("SELECT COALESCE(MAX(id), 0) FROM olap_cubes").fetchone()[0]
+        # Проверяем существование
+        exists = self.conn.execute("SELECT COUNT(*) FROM olap_cubes WHERE name = ?", [cube.name]).fetchone()[0]
         
-        self.conn.execute("""
-            INSERT OR REPLACE INTO olap_cubes (id, name, table_name, definition, updated_at, owner)
-            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
-        """, [max_id + 1, cube.name, cube.table_name, json.dumps(definition), current_user])
+        if exists > 0:
+            self.conn.execute("""
+                UPDATE olap_cubes 
+                SET table_name = ?, definition = ?, updated_at = CURRENT_TIMESTAMP, owner = ?
+                WHERE name = ?
+            """, [cube.table_name, json.dumps(definition), current_user, cube.name])
+        else:
+            max_id = self.conn.execute("SELECT COALESCE(MAX(id), 0) FROM olap_cubes").fetchone()[0]
+            self.conn.execute("""
+                INSERT INTO olap_cubes (id, name, table_name, definition, created_at, updated_at, owner)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?)
+            """, [max_id + 1, cube.name, cube.table_name, json.dumps(definition), current_user])
     
     def slice_dice(self, cube_name: str, rows: List[str], cols: List[str], 
                    measures: List[str], filters: Dict = None) -> pd.DataFrame:
-        """Операция slice and dice"""
         dimensions = list(set(rows + cols))
         measures_with_agg = [(m, self.cubes[cube_name].measures[m].default_agg) for m in measures]
         
@@ -504,7 +506,6 @@ class OLAPManager:
                    top_n: int = None,
                    order_by: List[Tuple[str, str]] = None,
                    use_cache: bool = True) -> pd.DataFrame:
-        """Оптимизированное выполнение запроса с кэшированием"""
         
         start_time = datetime.now()
         
@@ -584,7 +585,6 @@ class OLAPManager:
         return result
     
     def _log_query(self, cube_name: str, query: str, execution_time: float, rows: int):
-        """Логирование запросов для оптимизации"""
         current_user = st.session_state.get('username', 'anonymous')
         try:
             max_id = self.conn.execute("SELECT COALESCE(MAX(id), 0) FROM query_history").fetchone()[0]
@@ -596,7 +596,6 @@ class OLAPManager:
             pass
     
     def get_query_performance_stats(self) -> pd.DataFrame:
-        """Статистика производительности запросов"""
         try:
             return self.conn.execute("""
                 SELECT 
@@ -614,16 +613,12 @@ class OLAPManager:
     
     def create_materialized_view(self, cube_name: str, view_name: str, 
                                  dimensions: List[str], measures: List[str]):
-        """Создание материализованного представления для ускорения"""
         cube = self.cubes[cube_name]
-        
         measures_with_agg = [(m, cube.measures[m].default_agg) for m in measures]
         df = self.query_cube(cube_name, dimensions, measures_with_agg)
-        
         view_table = f"mv_{view_name.lower().replace(' ', '_')}"
         self.conn.register('mv_df', df)
         self.conn.execute(f"CREATE OR REPLACE TABLE {view_table} AS SELECT * FROM mv_df")
-        
         return view_table
 
 # ============================================
@@ -634,7 +629,6 @@ class UserManager:
         self.conn = conn
     
     def authenticate(self, username: str, password: str) -> bool:
-        """Аутентификация пользователя"""
         password_hash = hashlib.sha256(password.encode()).hexdigest()
         try:
             result = self.conn.execute("""
@@ -650,17 +644,20 @@ class UserManager:
                 st.session_state.username = username
                 st.session_state.role = result[0]
                 return True
-        except Exception as e:
-            st.error(f"Ошибка аутентификации: {e}")
+        except:
+            pass
         return False
     
     def create_user(self, username: str, password: str, role: str = 'VIEWER') -> bool:
-        """Создание нового пользователя"""
         if st.session_state.get('role') != 'ADMIN':
             return False
         
         password_hash = hashlib.sha256(password.encode()).hexdigest()
         try:
+            exists = self.conn.execute("SELECT COUNT(*) FROM users WHERE username = ?", [username]).fetchone()[0]
+            if exists > 0:
+                return False
+            
             max_id = self.conn.execute("SELECT COALESCE(MAX(id), 0) FROM users").fetchone()[0]
             self.conn.execute("""
                 INSERT INTO users (id, username, password_hash, role, created_at)
@@ -671,7 +668,6 @@ class UserManager:
             return False
     
     def check_permission(self, cube_name: str, required_level: str = 'READ') -> bool:
-        """Проверка прав доступа"""
         if 'username' not in st.session_state:
             return False
         
@@ -696,7 +692,6 @@ class UserManager:
             return False
     
     def get_users_list(self) -> pd.DataFrame:
-        """Список пользователей"""
         try:
             return self.conn.execute("""
                 SELECT username, role, created_at, last_login 
@@ -714,7 +709,6 @@ class DashboardManager:
         self.olap_manager = olap_manager
     
     def create_treemap(self, cube_name: str, dimension: str, measure: str, top_n: int = 20):
-        """Создание treemap визуализации"""
         df = self.olap_manager.query_cube(
             cube_name,
             [dimension],
@@ -722,7 +716,6 @@ class DashboardManager:
             top_n=top_n,
             order_by=[(measure, 'DESC')]
         )
-        
         fig = px.treemap(
             df,
             path=[dimension],
@@ -732,14 +725,12 @@ class DashboardManager:
         return fig
     
     def create_waterfall(self, cube_name: str, dimension: str, measure: str):
-        """Создание waterfall диаграммы"""
         df = self.olap_manager.query_cube(
             cube_name,
             [dimension],
             [(measure, 'SUM')],
             order_by=[(dimension, 'ASC')]
         )
-        
         fig = go.Figure(go.Waterfall(
             name="Изменения",
             orientation="v",
@@ -750,14 +741,11 @@ class DashboardManager:
             textposition="outside",
             connector={"line": {"color": "rgb(63, 63, 63)"}},
         ))
-        
         fig.update_layout(title=f"Waterfall анализ {measure}")
         return fig
     
     def create_heatmap(self, cube_name: str, row_dim: str, col_dim: str, measure: str):
-        """Создание heatmap"""
         pivot_df = self.olap_manager.slice_dice(cube_name, [row_dim], [col_dim], [measure])
-        
         fig = px.imshow(
             pivot_df,
             title=f"Heatmap: {measure}",
@@ -767,30 +755,23 @@ class DashboardManager:
         return fig
     
     def create_kpi_cards(self, cube_name: str, measures: List[str]) -> Dict:
-        """Создание KPI карточек"""
         kpis = {}
-        
         for measure in measures:
             df = self.olap_manager.query_cube(cube_name, [], [(measure, 'SUM')])
             current = df[measure].iloc[0] if not df.empty else 0
-            
             kpis[measure] = {
                 'current': current,
                 'change': 0,
                 'change_pct': 0
             }
-        
         return kpis
     
     def export_dashboard_to_html(self, figures: List[go.Figure]) -> str:
-        """Экспорт дашборда в HTML"""
         html_content = "<html><head><title>OLAP Dashboard</title>"
         html_content += "<script src='https://cdn.plot.ly/plotly-latest.min.js'></script>"
         html_content += "</head><body>"
-        
         for fig in figures:
             html_content += fig.to_html(include_plotlyjs=False)
-        
         html_content += "</body></html>"
         return html_content
 
@@ -802,14 +783,12 @@ class OLAPAPI:
         self.olap_manager = olap_manager
     
     def execute_mdx_query(self, cube_name: str, mdx_query: str) -> Dict:
-        """Выполнение MDX-подобного запроса"""
         result = {
             'cube': cube_name,
             'query': mdx_query,
             'result': None,
             'error': None
         }
-        
         try:
             if 'SELECT' in mdx_query.upper():
                 measures_start = mdx_query.upper().find('SELECT') + 6
@@ -827,26 +806,19 @@ class OLAPAPI:
                 
                 measures_with_agg = [(m, 'SUM') for m in measures]
                 df = self.olap_manager.query_cube(cube_name, dimensions, measures_with_agg)
-                
                 result['result'] = df.to_dict('records')
         except Exception as e:
             result['error'] = str(e)
-        
         return result
     
     def export_to_power_bi(self, cube_name: str) -> bytes:
-        """Экспорт данных для Power BI"""
         cube = self.olap_manager.cubes[cube_name]
-        
         dimensions = list(cube.dimensions.keys())
         measures = [(m, 'SUM') for m in cube.measures.keys()]
-        
         df = self.olap_manager.query_cube(cube_name, dimensions, measures)
-        
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             df.to_excel(writer, sheet_name='Data', index=False)
-            
             metadata = pd.DataFrame([
                 {'Dimension': d, 'Column': cube.dimensions[d].column}
                 for d in dimensions
@@ -855,11 +827,9 @@ class OLAPAPI:
                 for m in cube.measures.keys()
             ])
             metadata.to_excel(writer, sheet_name='Metadata', index=False)
-        
         return output.getvalue()
     
     def get_api_endpoints(self) -> Dict:
-        """Получение списка API эндпоинтов"""
         return {
             'query': {
                 'method': 'POST',
@@ -876,9 +846,7 @@ class OLAPAPI:
                 'method': 'GET',
                 'endpoint': '/api/export/{cube_name}',
                 'description': 'Export cube data',
-                'parameters': {
-                    'format': 'csv|excel|json|parquet'
-                }
+                'parameters': {'format': 'csv|excel|json|parquet'}
             },
             'metadata': {
                 'method': 'GET',
@@ -914,7 +882,6 @@ class OLAPInterface:
             st.session_state.pivot_measures = []
     
     def render_login_page(self):
-        """Страница входа"""
         st.markdown("<div class='login-container'>", unsafe_allow_html=True)
         st.markdown("## 🔐 Вход в систему")
         st.markdown("---")
@@ -939,7 +906,6 @@ class OLAPInterface:
         st.markdown("</div>", unsafe_allow_html=True)
     
     def render_main_interface(self):
-        """Основной интерфейс"""
         st.markdown(f"""
         <div class='main-header'>
             <h1>🎲 OLAP Analytics Platform</h1>
@@ -1037,7 +1003,6 @@ class OLAPInterface:
             self.render_api_documentation()
     
     def render_analysis_mode(self):
-        """Режим анализа данных"""
         if st.session_state.current_cube:
             cube = st.session_state.current_cube
             
@@ -1050,81 +1015,45 @@ class OLAPInterface:
             
             with tab1:
                 self.render_pivot_table(cube)
-            
             with tab2:
                 self.render_visualizations(cube)
-            
             with tab3:
                 self.render_drill_down(cube)
-            
             with tab4:
                 self.render_optimization_panel(cube)
         else:
             st.info("👈 Выберите куб для анализа в боковом меню")
     
     def render_pivot_table(self, cube: OLAPCube):
-        """Продвинутая сводная таблица"""
         st.markdown("### 🎯 Интерактивная сводная таблица")
         
         col1, col2 = st.columns(2)
         
         with col1:
-            row_dims = st.multiselect(
-                "Строки",
-                list(cube.dimensions.keys()),
-                key="pivot_rows"
-            )
-        
+            row_dims = st.multiselect("Строки", list(cube.dimensions.keys()), key="pivot_rows")
         with col2:
-            col_dims = st.multiselect(
-                "Колонки",
-                list(cube.dimensions.keys()),
-                key="pivot_cols"
-            )
+            col_dims = st.multiselect("Колонки", list(cube.dimensions.keys()), key="pivot_cols")
         
-        measures = st.multiselect(
-            "Меры",
-            list(cube.measures.keys()),
-            key="pivot_measures"
-        )
+        measures = st.multiselect("Меры", list(cube.measures.keys()), key="pivot_measures")
         
         with st.expander("⚙️ Расширенные настройки"):
             col_opt1, col_opt2, col_opt3 = st.columns(3)
-            
             with col_opt1:
                 top_n = st.number_input("Топ N", 0, 10000, 0)
-                show_totals = st.checkbox("Итоги", True)
-            
             with col_opt2:
-                show_percentages = st.checkbox("Проценты", False)
-                sort_by = st.selectbox("Сортировка", measures if measures else [])
-            
+                export_format = st.selectbox("Экспорт", ["CSV", "Excel"])
             with col_opt3:
-                use_materialized = st.checkbox("Использовать кэш", True)
-                export_format = st.selectbox("Экспорт", ["CSV", "Excel", "JSON", "Parquet"])
+                use_cache = st.checkbox("Использовать кэш", True)
         
         if st.button("🎯 Построить", type="primary") and measures:
             with st.spinner("Выполнение запроса..."):
-                if use_materialized and len(measures) > 0:
-                    view_name = f"temp_{datetime.now().strftime('%H%M%S')}"
-                    try:
-                        self.olap_manager.create_materialized_view(
-                            cube.name, view_name, row_dims + col_dims, measures
-                        )
-                    except:
-                        pass
-                
                 pivot_df = self.olap_manager.slice_dice(
                     cube.name, row_dims, col_dims, measures,
                     st.session_state.get('filters', {})
                 )
                 
                 if not pivot_df.empty:
-                    try:
-                        styled_df = pivot_df.style.background_gradient(cmap='Blues', axis=None)
-                        st.dataframe(styled_df, use_container_width=True, height=600)
-                    except:
-                        st.dataframe(pivot_df, use_container_width=True, height=600)
+                    st.dataframe(pivot_df, use_container_width=True, height=600)
                     
                     if export_format == "CSV":
                         csv = pivot_df.to_csv()
@@ -1136,13 +1065,9 @@ class OLAPInterface:
                         st.download_button("📥 Скачать Excel", output.getvalue(), "pivot.xlsx")
     
     def render_visualizations(self, cube: OLAPCube):
-        """Визуализации данных"""
         st.markdown("### 📊 Визуализации")
         
-        viz_type = st.selectbox(
-            "Тип визуализации",
-            ["Treemap", "Waterfall", "Heatmap"]
-        )
+        viz_type = st.selectbox("Тип визуализации", ["Treemap", "Waterfall", "Heatmap"])
         
         if viz_type == "Treemap":
             dim = st.selectbox("Измерение", list(cube.dimensions.keys()))
@@ -1174,12 +1099,9 @@ class OLAPInterface:
                     st.plotly_chart(fig, use_container_width=True)
     
     def render_drill_down(self, cube: OLAPCube):
-        """Drill-down анализ"""
         st.markdown("### 🔍 Drill-down по иерархиям")
         
-        hierarchical_dims = {
-            name: dim for name, dim in cube.dimensions.items() if dim.hierarchy
-        }
+        hierarchical_dims = {name: dim for name, dim in cube.dimensions.items() if dim.hierarchy}
         
         if hierarchical_dims:
             dim_name = st.selectbox("Измерение", list(hierarchical_dims.keys()))
@@ -1224,15 +1146,12 @@ class OLAPInterface:
             st.info("Нет измерений с иерархиями")
     
     def render_optimization_panel(self, cube: OLAPCube):
-        """Панель оптимизации"""
         st.markdown("### ⚡ Оптимизация производительности")
         
         st.markdown("#### 📊 Статистика запросов")
         stats_df = self.olap_manager.get_query_performance_stats()
         if not stats_df.empty:
             st.dataframe(stats_df, use_container_width=True)
-        else:
-            st.info("Нет данных о запросах")
         
         st.markdown("#### 💾 Материализованные представления")
         
@@ -1244,14 +1163,13 @@ class OLAPInterface:
         
         if mv_measures:
             view_name = st.text_input("Название", f"MV_{datetime.now().strftime('%Y%m%d')}")
-            if st.button("Создать материализованное представление"):
+            if st.button("Создать"):
                 table_name = self.olap_manager.create_materialized_view(
                     cube.name, view_name, mv_dims, mv_measures
                 )
                 st.success(f"✅ Создано: {table_name}")
     
     def render_dashboard_mode(self):
-        """Режим дашбордов"""
         st.markdown("### 📈 Интерактивные дашборды")
         
         if st.session_state.current_cube:
@@ -1266,14 +1184,9 @@ class OLAPInterface:
                 
                 for i, (measure, values) in enumerate(kpis.items()):
                     with cols[i]:
-                        st.metric(
-                            measure,
-                            f"{values['current']:,.0f}",
-                            delta=f"{values['change_pct']:.1f}%" if values['change_pct'] else None
-                        )
+                        st.metric(measure, f"{values['current']:,.0f}")
             
             st.markdown("#### 📊 Визуализации")
-            
             chart_cols = st.columns(2)
             
             with chart_cols[0]:
@@ -1294,83 +1207,45 @@ class OLAPInterface:
             st.info("👈 Выберите куб для просмотра дашборда")
     
     def render_cube_designer(self):
-        """Конструктор кубов"""
         st.markdown("### 🏗️ Конструктор OLAP кубов")
         
         if not self.user_manager.check_permission('*', 'WRITE'):
-            st.error("❌ Недостаточно прав для создания кубов")
+            st.error("❌ Недостаточно прав")
             return
         
-        uploaded_files = st.file_uploader(
-            "Загрузите данные",
-            type=['csv', 'xlsx', 'xls', 'parquet'],
-            accept_multiple_files=True
-        )
+        uploaded_file = st.file_uploader("Загрузите данные", type=['csv', 'xlsx', 'parquet'])
         
-        if uploaded_files:
+        if uploaded_file:
             cube_name = st.text_input("Название куба", f"Cube_{datetime.now().strftime('%Y%m%d')}")
             
-            dfs = []
-            for file in uploaded_files:
-                try:
-                    if file.name.endswith('.csv'):
-                        df = pd.read_csv(file)
-                    elif file.name.endswith('.parquet'):
-                        df = pd.read_parquet(file)
-                    else:
-                        df = pd.read_excel(file)
-                    dfs.append(df)
-                except Exception as e:
-                    st.error(f"Ошибка загрузки {file.name}: {e}")
-            
-            if dfs:
-                combined_df = pd.concat(dfs, ignore_index=True)
+            try:
+                if uploaded_file.name.endswith('.csv'):
+                    df = pd.read_csv(uploaded_file)
+                elif uploaded_file.name.endswith('.parquet'):
+                    df = pd.read_parquet(uploaded_file)
+                else:
+                    df = pd.read_excel(uploaded_file)
                 
                 st.markdown("**Предпросмотр:**")
-                st.dataframe(combined_df.head(10), use_container_width=True)
-                
-                partition_col = st.selectbox(
-                    "Партиционировать по (опционально)",
-                    ['Нет'] + list(combined_df.columns)
-                )
-                
-                with st.expander("🔧 Ручная настройка"):
-                    st.markdown("**Измерения:**")
-                    dimensions = st.multiselect(
-                        "Выберите измерения",
-                        combined_df.columns,
-                        default=[c for c in combined_df.columns if combined_df[c].dtype == 'object']
-                    )
-                    
-                    st.markdown("**Меры:**")
-                    measures = st.multiselect(
-                        "Выберите меры",
-                        combined_df.columns,
-                        default=[c for c in combined_df.columns if pd.api.types.is_numeric_dtype(combined_df[c])]
-                    )
+                st.dataframe(df.head(10), use_container_width=True)
                 
                 if st.button("🎲 Создать куб", type="primary"):
-                    with st.spinner("Создание куба и оптимизация..."):
-                        cube = self.olap_manager.create_cube_from_dataframe(
-                            cube_name,
-                            combined_df,
-                            auto_detect=True,
-                            partition_by=partition_col if partition_col != 'Нет' else None
-                        )
-                        
+                    with st.spinner("Создание куба..."):
+                        cube = self.olap_manager.create_cube_from_dataframe(cube_name, df, auto_detect=True)
                         st.session_state.current_cube = cube
                         st.success(f"✅ Куб '{cube_name}' создан!")
                         
                         col1, col2, col3 = st.columns(3)
                         with col1:
-                            st.metric("Строк", len(combined_df))
+                            st.metric("Строк", len(df))
                         with col2:
                             st.metric("Измерений", len(cube.dimensions))
                         with col3:
                             st.metric("Мер", len(cube.measures))
+            except Exception as e:
+                st.error(f"Ошибка загрузки: {e}")
     
     def render_slice_manager(self):
-        """Управление срезами"""
         st.markdown("### 💾 Управление срезами данных")
         
         if st.session_state.current_cube:
@@ -1378,15 +1253,13 @@ class OLAPInterface:
             
             st.markdown("#### 💾 Сохранить текущий срез")
             slice_name = st.text_input("Название среза")
-            slice_desc = st.text_area("Описание")
             
-            if st.button("Сохранить срез"):
+            if st.button("Сохранить срез") and slice_name:
                 slice_def = {
                     'cube': cube.name,
                     'filters': st.session_state.get('filters', {}),
                     'dimensions': st.session_state.get('pivot_rows', []) + st.session_state.get('pivot_cols', []),
                     'measures': st.session_state.get('pivot_measures', []),
-                    'description': slice_desc,
                     'created_by': st.session_state.get('username'),
                     'timestamp': datetime.now().isoformat()
                 }
@@ -1399,53 +1272,32 @@ class OLAPInterface:
                     """, [max_id + 1, cube.name, slice_name, json.dumps(slice_def), st.session_state.get('username')])
                     st.success("✅ Срез сохранен!")
                 except Exception as e:
-                    st.error(f"Ошибка сохранения: {e}")
+                    st.error(f"Ошибка: {e}")
             
             st.markdown("#### 📂 Сохраненные срезы")
-            
             try:
                 slices_df = self.conn.execute("""
-                    SELECT id, slice_name, definition, created_at, owner
+                    SELECT id, slice_name, created_at, owner
                     FROM olap_slices 
                     WHERE cube_name = ?
                     ORDER BY created_at DESC
                 """, [cube.name]).fetchdf()
                 
                 if not slices_df.empty:
-                    for _, row in slices_df.iterrows():
-                        with st.expander(f"{row['slice_name']} - {row['created_at']}"):
-                            slice_def = json.loads(row['definition'])
-                            st.markdown(f"**Владелец:** {row['owner']}")
-                            st.markdown(f"**Описание:** {slice_def.get('description', 'Нет')}")
-                            
-                            col1, col2 = st.columns(2)
-                            with col1:
-                                if st.button("📂 Загрузить", key=f"load_{row['id']}"):
-                                    st.session_state.filters = slice_def['filters']
-                                    st.rerun()
-                            with col2:
-                                if st.button("🗑️ Удалить", key=f"del_{row['id']}"):
-                                    self.conn.execute("DELETE FROM olap_slices WHERE id = ?", [row['id']])
-                                    st.rerun()
+                    st.dataframe(slices_df, use_container_width=True)
             except:
                 st.info("Нет сохраненных срезов")
         else:
-            st.info("👈 Выберите куб для управления срезами")
+            st.info("👈 Выберите куб")
     
     def render_admin_panel(self):
-        """Административная панель"""
-        st.markdown("### ⚙️ Администрирование системы")
+        st.markdown("### ⚙️ Администрирование")
         
         if st.session_state.get('role') != 'ADMIN':
             st.error("❌ Доступ только для администраторов")
             return
         
-        admin_tabs = st.tabs([
-            "👥 Пользователи",
-            "🔐 Права доступа",
-            "📊 Мониторинг",
-            "🗄️ База данных"
-        ])
+        admin_tabs = st.tabs(["👥 Пользователи", "🔐 Права", "📊 Мониторинг"])
         
         with admin_tabs[0]:
             st.markdown("#### 👥 Управление пользователями")
@@ -1460,7 +1312,7 @@ class OLAPInterface:
                         st.success("✅ Пользователь создан")
                         st.rerun()
                     else:
-                        st.error("❌ Ошибка создания")
+                        st.error("❌ Ошибка")
             
             users_df = self.user_manager.get_users_list()
             if not users_df.empty:
@@ -1471,59 +1323,52 @@ class OLAPInterface:
             
             try:
                 cubes = self.conn.execute("SELECT name FROM olap_cubes").fetchdf()
-                
                 if not cubes.empty:
-                    role = st.selectbox("Роль", ["VIEWER", "ANALYST", "ADMIN"])
+                    role = st.selectbox("Роль", ["VIEWER", "ANALYST"])
                     cube = st.selectbox("Куб", cubes['name'].tolist())
-                    access = st.selectbox("Уровень доступа", ["READ", "WRITE", "ADMIN"])
+                    access = st.selectbox("Доступ", ["READ", "WRITE"])
                     
-                    if st.button("Назначить права"):
-                        max_id = self.conn.execute("SELECT COALESCE(MAX(id), 0) FROM permissions").fetchone()[0]
-                        self.conn.execute("""
-                            INSERT OR REPLACE INTO permissions (id, user_role, cube_name, access_level)
-                            VALUES (?, ?, ?, ?)
-                        """, [max_id + 1, role, cube, access])
+                    if st.button("Назначить"):
+                        exists = self.conn.execute(
+                            "SELECT COUNT(*) FROM permissions WHERE user_role = ? AND cube_name = ?",
+                            [role, cube]
+                        ).fetchone()[0]
+                        
+                        if exists > 0:
+                            self.conn.execute(
+                                "UPDATE permissions SET access_level = ? WHERE user_role = ? AND cube_name = ?",
+                                [access, role, cube]
+                            )
+                        else:
+                            max_id = self.conn.execute("SELECT COALESCE(MAX(id), 0) FROM permissions").fetchone()[0]
+                            self.conn.execute(
+                                "INSERT INTO permissions (id, user_role, cube_name, access_level) VALUES (?, ?, ?, ?)",
+                                [max_id + 1, role, cube, access]
+                            )
                         st.success("✅ Права назначены")
             except:
                 st.info("Нет созданных кубов")
         
         with admin_tabs[2]:
-            st.markdown("#### 📊 Мониторинг системы")
-            
             stats_df = self.olap_manager.get_query_performance_stats()
             if not stats_df.empty:
                 st.dataframe(stats_df, use_container_width=True)
             
             cache_stats = self.olap_manager.query_cache.get_stats()
             st.json(cache_stats)
-        
-        with admin_tabs[3]:
-            st.markdown("#### 🗄️ Управление базой данных")
-            
-            if st.button("📊 Статистика таблиц"):
-                tables = self.conn.execute("SHOW TABLES").fetchdf()
-                st.dataframe(tables, use_container_width=True)
-            
-            if st.button("🗜️ Оптимизировать базу"):
-                self.conn.execute("VACUUM")
-                st.success("✅ База данных оптимизирована")
     
     def render_api_documentation(self):
-        """Документация API"""
         st.markdown("### 🔌 API для внешних систем")
         
         endpoints = self.api.get_api_endpoints()
-        
         for name, endpoint in endpoints.items():
             with st.expander(f"{endpoint['method']} {endpoint['endpoint']}"):
                 st.markdown(f"**Описание:** {endpoint['description']}")
-                st.markdown("**Параметры:**")
                 st.json(endpoint['parameters'])
         
-        st.markdown("---")
-        st.markdown("#### 🧪 Тестирование API")
-        
         if st.session_state.current_cube:
+            st.markdown("---")
+            st.markdown("#### 🧪 Тестирование API")
             cube = st.session_state.current_cube
             
             if cube.measures and cube.dimensions:
@@ -1541,14 +1386,14 @@ class OLAPInterface:
             if st.button("📥 Экспорт для Power BI"):
                 data = self.api.export_to_power_bi(st.session_state.current_cube.name)
                 st.download_button(
-                    "Скачать Power BI файл",
+                    "Скачать",
                     data,
-                    f"{st.session_state.current_cube.name}_powerbi.xlsx",
+                    f"{cube.name}_powerbi.xlsx",
                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
 
 # ============================================
-# 10. ЗАПУСК ПРИЛОЖЕНИЯ
+# 10. ЗАПУСК
 # ============================================
 def main():
     interface = OLAPInterface()
